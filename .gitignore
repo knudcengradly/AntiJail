@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# Android / Gradle
+mobile-overlay-android/.gradle/
+mobile-overlay-android/build/
+mobile-overlay-android/app/build/
+mobile-overlay-android/local.properties
+mobile-overlay-android/keystore.properties
+mobile-overlay-android/*.jks
+mobile-overlay-android/*.keystore
+*.apk
+*.aab
+*.dex
+*.class
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Debug / temp dumps
+*.log
+line193.txt
+line281_all.txt
+revert_extract.txt
+settings_new.txt
+vision_new.txt
+vision_orig.txt
+watch_spider_*.txt
+emulator-*.png
+
+# Separate nested repo (own remote) — not part of AntiJail
+Graal-Antijail/
