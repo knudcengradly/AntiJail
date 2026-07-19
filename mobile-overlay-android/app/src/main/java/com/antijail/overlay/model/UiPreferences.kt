@@ -18,7 +18,14 @@ data class UiPreferences(
      * Detection/image zoom calibration (0.5–2.0). Default 50% on phones — scales detection regions
      * and template matching only, not tap buttons. Adjust via Setup → Zoom Level slider.
      */
-    val detectionScale: Float = 0.5f
+    val detectionScale: Float = 0.5f,
+
+    /**
+     * Last Reference Spot *position only* (box coords). Restored on next Proceed.
+     * The pixels inside the box are NEVER saved here — they are captured fresh each Start
+     * and discarded when the macro stops.
+     */
+    val lastReferenceSpot: DetectionRegion? = null
 
 )
 

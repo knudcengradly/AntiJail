@@ -50,7 +50,8 @@ object VisionConfig {
 
 
 
-    const val ROCK_COLOR_TOLERANCE = 15
+    /** Slightly looser than before so laggy/dark frames still catch mined rock. */
+    const val ROCK_COLOR_TOLERANCE = 18
 
 
 
@@ -74,39 +75,28 @@ object VisionConfig {
 
     const val SPIDER_COLOR_TOLERANCE = 10
 
-
+    /** Fast scans use the same tight tolerance — looser values matched ground/rocks. */
+    const val SPIDER_COLOR_TOLERANCE_FAST = 10
 
     /** Distinct spider colours required in one local cluster to engage combat. */
-
-
-
     const val SPIDER_MIN_DISTINCT_COLORS = 2
 
-
+    const val SPIDER_MIN_DISTINCT_COLORS_FAST = 2
 
     /** Still alive if at least this many spider colours remain clustered. */
-
-
-
     const val SPIDER_ALIVE_MIN_DISTINCT_COLORS = 1
 
-
-
     /** Local window (px) — spider shades must co-occur inside this square. */
-
-
-
     const val SPIDER_CLUSTER_WINDOW_PX = 56
 
+    const val SPIDER_CLUSTER_WINDOW_PX_FAST = 56
 
-
-    const val SPIDER_MIN_CLUSTER_PIXELS = 2
-
-
+    /** Need a few co-located pixels so dirt/rock flecks don't become a "spider". */
+    const val SPIDER_MIN_CLUSTER_PIXELS = 3
 
     const val SPIDER_CLUSTER_STEP_PX = 8
 
-
+    const val SPIDER_CLUSTER_STEP_PX_FAST = 8
 
 
 
@@ -126,7 +116,8 @@ object VisionConfig {
 
     const val HEALTH_SIGNAL_MIN_COLORS = 4
 
-
+    /** Fast/post-rock HP — 3 colours (2 was too loose; 4 missed real hits). */
+    const val HEALTH_SIGNAL_MIN_COLORS_FAST = 3
 
     const val HEALTH_SIGNAL_MIN_PIXELS = 1
 

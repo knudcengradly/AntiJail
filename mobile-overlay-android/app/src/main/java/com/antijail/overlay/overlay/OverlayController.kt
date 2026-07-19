@@ -279,6 +279,24 @@ class OverlayController(
 
     fun refreshPlayState() {
         if (!isEditMode) rebuildToolbar()
+        updateReferenceSpotRunningColor()
+    }
+
+    /** Match toolbar: green outline while macro is running, light-blue while placing. */
+    private fun updateReferenceSpotRunningColor() {
+        val view = referenceSpotBoxView ?: return
+        val stroke = if (isRunningProvider()) {
+            Color.parseColor("#66E088")
+        } else {
+            Color.parseColor("#74BCFF")
+        }
+        val bg = view.background as? GradientDrawable
+            ?: GradientDrawable().also {
+                it.shape = GradientDrawable.RECTANGLE
+                it.setColor(Color.TRANSPARENT)
+                view.background = it
+            }
+        bg.setStroke(dpToPx(2), stroke)
     }
 
     fun setToolbarOpacity(@Suppress("UNUSED_PARAMETER") opacity: Float) {
@@ -287,6 +305,12 @@ class OverlayController(
     }
 
     fun showMacroToast(message: String) {
+        // Fire-and-forget: engine/detector threads post the toast and return instantly,
+        // so popup view work never blocks mining timings.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { showMacroToast(message) }
+            return
+        }
         hideMacroToast()
         val tv = TextView(context).apply {
             text = message
@@ -318,6 +342,10 @@ class OverlayController(
     }
 
     fun hideMacroToast() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { hideMacroToast() }
+            return
+        }
         macroToastHideRunnable?.let { mainHandler.removeCallbacks(it) }
         macroToastHideRunnable = null
         macroToastView?.let { runCatching { windowManager.removeView(it) } }
@@ -2258,6 +2286,7 @@ class OverlayController(
                 setStroke(dpToPx(2), Color.parseColor("#74BCFF"))
             }
         }
+        val saved = uiPreferencesProvider().lastReferenceSpot
         val boxParams = WindowManager.LayoutParams(
             sizePx, sizePx,
             overlayType,
@@ -2266,8 +2295,13 @@ class OverlayController(
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = ((screenWidthPx() - sizePx) / 2).coerceAtLeast(0)
-            y = ((screenHeightPx() - sizePx) / 2).coerceAtLeast(0)
+            if (saved != null) {
+                x = saved.left.toInt().coerceIn(0, (screenWidthPx() - sizePx).coerceAtLeast(0))
+                y = saved.top.toInt().coerceIn(0, (screenHeightPx() - sizePx).coerceAtLeast(0))
+            } else {
+                x = ((screenWidthPx() - sizePx) / 2).coerceAtLeast(0)
+                y = ((screenHeightPx() - sizePx) / 2).coerceAtLeast(0)
+            }
         }
         makeDraggable(box, boxParams)
         addOverlay(box, boxParams)
@@ -2278,6 +2312,11 @@ class OverlayController(
             val params = referenceSpotBoxParams
             val view = referenceSpotBoxView
             val region = if (view != null && params != null) regionOfView(view, params) else null
+            // Persist box position only — the image inside is captured later in MainActivity
+            // for this Start, then discarded on Stop (never stored in prefs).
+            if (region != null) {
+                onUiPreferencesChanged(uiPreferencesProvider().copy(lastReferenceSpot = region))
+            }
             referenceStartButtonView?.let { runCatching { windowManager.removeView(it) } }
             referenceStartButtonView = null
             // Box stays as a visual outline but becomes pass-through so it never blocks game touches.
@@ -2285,7 +2324,28 @@ class OverlayController(
                 params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 runCatching { windowManager.updateViewLayout(view, params) }
             }
-            onMineStart(settings, region)
+            // Turn green immediately; refreshPlayState also syncs once mining isRunning.
+            view?.background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(Color.TRANSPARENT)
+                setStroke(dpToPx(2), Color.parseColor("#66E088"))
+            }
+            // Compare only pixels INSIDE the outline — the stroke itself is drawn over the
+            // region and changes colour (blue→green), which would poison the baseline.
+            val insetPx = dpToPx(4).toFloat()
+            val detectionRegion = region?.let {
+                if (it.right - it.left > insetPx * 2 && it.bottom - it.top > insetPx * 2) {
+                    DetectionRegion(
+                        it.left + insetPx,
+                        it.top + insetPx,
+                        it.right - insetPx,
+                        it.bottom - insetPx
+                    )
+                } else {
+                    it
+                }
+            }
+            onMineStart(settings, detectionRegion)
         }
         val btnParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,

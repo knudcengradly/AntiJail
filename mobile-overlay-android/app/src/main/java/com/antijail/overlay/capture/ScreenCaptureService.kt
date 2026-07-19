@@ -561,12 +561,11 @@ class ScreenCaptureService : Service() {
     }
 
     /**
-     * Fraction (0..1) of how similar [region] currently looks vs [baseline]. Both crops are
-     * downscaled to a fixed grid and compared by mean per-pixel RGB closeness. Returns 1f
-     * (treated as intact) if the current frame can't be captured.
+     * Fraction (0..1) of sampled pixels that remain visually close to [baseline].
+     * A failed capture is treated as changed; captureRegionBitmap already retries for ~1.5s.
      */
     fun regionSimilarity(region: DetectionRegion, baseline: Bitmap): Float {
-        val current = captureRegionBitmap(region) ?: return 1f
+        val current = captureRegionBitmap(region) ?: return 0f
         return try {
             bitmapSimilarity(baseline, current)
         } finally {
@@ -579,7 +578,7 @@ class ScreenCaptureService : Service() {
         val sa = Bitmap.createScaledBitmap(a, n, n, true)
         val sb = Bitmap.createScaledBitmap(b, n, n, true)
         return try {
-            var total = 0.0
+            var matchingPixels = 0
             for (y in 0 until n) {
                 for (x in 0 until n) {
                     val pa = sa.getPixel(x, y)
@@ -587,10 +586,12 @@ class ScreenCaptureService : Service() {
                     val dr = abs(Color.red(pa) - Color.red(pb))
                     val dg = abs(Color.green(pa) - Color.green(pb))
                     val db = abs(Color.blue(pa) - Color.blue(pb))
-                    total += 1.0 - (dr + dg + db) / (3.0 * 255.0)
+                    // Small capture/compression variations are allowed per pixel; a visibly
+                    // changed pixel no longer gets diluted by unchanged background pixels.
+                    if ((dr + dg + db) / 3 <= 24) matchingPixels++
                 }
             }
-            (total / (n * n)).toFloat()
+            matchingPixels.toFloat() / (n * n)
         } finally {
             if (sa != a) runCatching { sa.recycle() }
             if (sb != b) runCatching { sb.recycle() }
@@ -784,9 +785,23 @@ class ScreenCaptureService : Service() {
     }
 
     /** Scans every pixel in [region] — mirrors [scanDrillCyanRegion]. */
-    fun scanRockColorsRegion(region: DetectionRegion): DrillScanResult {
+    fun scanRockColorsRegion(region: DetectionRegion): DrillScanResult =
+        scanRockColorsRegionInternal(region, fastCapture = false)
+
+    /**
+     * Post-attack rock path — short frame grabs so mined-rock hits stay near real-time
+     * (the default retry loop can take well over a second per poll).
+     */
+    fun scanRockColorsRegionFast(region: DetectionRegion): DrillScanResult =
+        scanRockColorsRegionInternal(region, fastCapture = true)
+
+    private fun scanRockColorsRegionInternal(
+        region: DetectionRegion,
+        fastCapture: Boolean
+    ): DrillScanResult {
         refreshDisplayMetrics()
-        val image = acquireLatestImageWithRetry(attempts = 20, sleepMs = 75L)
+        val (attempts, sleepMs) = if (fastCapture) 4 to 15L else 20 to 75L
+        val image = acquireLatestImageWithRetry(attempts = attempts, sleepMs = sleepMs)
             ?: return DrillScanResult(
                 matchingPixels = 0,
                 centerColorHex = "#000000",
@@ -993,9 +1008,14 @@ class ScreenCaptureService : Service() {
     suspend fun regionContainsBatteryDeadMessage(region: DetectionRegion): Boolean =
         regionScanMiningText(region).batteryDead
 
-    private fun pixelMatchesSpiderColor(r: Int, g: Int, b: Int): Int {
+    private fun pixelMatchesSpiderColor(
+        r: Int,
+        g: Int,
+        b: Int,
+        tolerance: Int = VisionConfig.SPIDER_COLOR_TOLERANCE
+    ): Int {
         for (i in VisionConfig.SPIDER_BODY_COLORS.indices) {
-            if (hexColorMatches(r, g, b, VisionConfig.SPIDER_BODY_COLORS[i], VisionConfig.SPIDER_COLOR_TOLERANCE)) {
+            if (hexColorMatches(r, g, b, VisionConfig.SPIDER_BODY_COLORS[i], tolerance)) {
                 return i
             }
         }
@@ -1006,13 +1026,57 @@ class ScreenCaptureService : Service() {
 
     /** Player health hit colours in the cyan setup box — go signal after rock is mined. */
     fun regionHasHealthHitSignal(region: DetectionRegion): Boolean =
-        regionContainsColorSet(
-            region,
-            VisionConfig.HEALTH_SIGNAL_COLORS,
-            VisionConfig.HEALTH_SIGNAL_TOLERANCE,
-            VisionConfig.HEALTH_SIGNAL_MIN_COLORS,
-            VisionConfig.HEALTH_SIGNAL_MIN_PIXELS
-        )
+        regionHasHealthHitSignalInternal(region, fastCapture = false)
+
+    /**
+     * Post-rock / combat path — one short frame grab so HP detection stays near-instant
+     * (the default path can retry for hundreds of ms per colour).
+     */
+    fun regionHasHealthHitSignalFast(region: DetectionRegion): Boolean =
+        regionHasHealthHitSignalInternal(region, fastCapture = true)
+
+    private fun regionHasHealthHitSignalInternal(
+        region: DetectionRegion,
+        fastCapture: Boolean
+    ): Boolean {
+        // Fast path: a few short grabs — too few attempts was missing real HP bars intermittently.
+        val (attempts, sleepMs) = if (fastCapture) 4 to 15L else 12 to 50L
+        val image = acquireLatestImageWithRetry(attempts = attempts, sleepMs = sleepMs) ?: return false
+        return try {
+            val targets = VisionConfig.HEALTH_SIGNAL_COLORS.map { hexToRgb(it) }
+            val tolerance = VisionConfig.HEALTH_SIGNAL_TOLERANCE
+            val minPixels = VisionConfig.HEALTH_SIGNAL_MIN_PIXELS
+            val minDistinct = if (fastCapture) {
+                VisionConfig.HEALTH_SIGNAL_MIN_COLORS_FAST
+            } else {
+                VisionConfig.HEALTH_SIGNAL_MIN_COLORS
+            }
+            withMappedRegionFromImage(region, image) { bitmap, left, top, right, bottom ->
+                val hits = IntArray(targets.size)
+                for (y in top until bottom) {
+                    for (x in left until right) {
+                        val pixel = bitmap.getPixel(x, y)
+                        val r = Color.red(pixel)
+                        val g = Color.green(pixel)
+                        val b = Color.blue(pixel)
+                        for (i in targets.indices) {
+                            if (hits[i] >= minPixels) continue
+                            val (rT, gT, bT) = targets[i]
+                            if (abs(r - rT) <= tolerance &&
+                                abs(g - gT) <= tolerance &&
+                                abs(b - bT) <= tolerance
+                            ) {
+                                hits[i]++
+                            }
+                        }
+                    }
+                }
+                hits.count { it >= minPixels } >= minDistinct
+            } ?: false
+        } finally {
+            image.close()
+        }
+    }
 
     /**
      * Pirate combat while fishing — requires at least one pirate HP colour AND player HP red
@@ -1193,7 +1257,17 @@ class ScreenCaptureService : Service() {
         scanSpiderClusterInternal(
             region,
             VisionConfig.SPIDER_MIN_DISTINCT_COLORS,
-            VisionConfig.SPIDER_MIN_CLUSTER_PIXELS
+            VisionConfig.SPIDER_MIN_CLUSTER_PIXELS,
+            fastCapture = false
+        )
+
+    /** Post-rock / combat — short frame grab + looser UP-spider thresholds. */
+    fun scanSpiderClusterFast(region: DetectionRegion): SpiderClusterResult =
+        scanSpiderClusterInternal(
+            region,
+            VisionConfig.SPIDER_MIN_DISTINCT_COLORS_FAST,
+            VisionConfig.SPIDER_MIN_CLUSTER_PIXELS,
+            fastCapture = true
         )
 
     fun isSpiderAliveColor(region: DetectionRegion): Boolean =
@@ -1228,7 +1302,12 @@ class ScreenCaptureService : Service() {
         minClusterPixels: Int,
         fastCapture: Boolean = false
     ): SpiderClusterResult {
-        val (attempts, sleepMs) = if (fastCapture) 2 to 50L else 20 to 75L
+        val (attempts, sleepMs) = if (fastCapture) 2 to 20L else 20 to 75L
+        val colorTol = if (fastCapture) {
+            VisionConfig.SPIDER_COLOR_TOLERANCE_FAST
+        } else {
+            VisionConfig.SPIDER_COLOR_TOLERANCE
+        }
         val image = acquireLatestImageWithRetry(attempts = attempts, sleepMs = sleepMs) ?: return SpiderClusterResult(
             detected = false,
             distinctColors = 0
@@ -1257,7 +1336,7 @@ class ScreenCaptureService : Service() {
                     val r = buffer.get(offset).toInt() and 0xFF
                     val g = buffer.get(offset + 1).toInt() and 0xFF
                     val b = buffer.get(offset + 2).toInt() and 0xFF
-                    val colorIndex = pixelMatchesSpiderColor(r, g, b)
+                    val colorIndex = pixelMatchesSpiderColor(r, g, b, colorTol)
                     if (colorIndex >= 0) {
                         matches.add(SpiderMatch(x, y, colorIndex))
                     }
@@ -1268,8 +1347,16 @@ class ScreenCaptureService : Service() {
                 return SpiderClusterResult(false, 0)
             }
 
-            val window = VisionConfig.SPIDER_CLUSTER_WINDOW_PX
-            val step = VisionConfig.SPIDER_CLUSTER_STEP_PX
+            val window = if (fastCapture) {
+                VisionConfig.SPIDER_CLUSTER_WINDOW_PX_FAST
+            } else {
+                VisionConfig.SPIDER_CLUSTER_WINDOW_PX
+            }
+            val step = if (fastCapture) {
+                VisionConfig.SPIDER_CLUSTER_STEP_PX_FAST
+            } else {
+                VisionConfig.SPIDER_CLUSTER_STEP_PX
+            }
             var bestDistinct = 0
             var bestMatches: List<SpiderMatch> = emptyList()
 

@@ -79,7 +79,12 @@ class MainActivity : ComponentActivity() {
     private var editDraftProfile: ActionProfile? = null
     private var isRunningState: Boolean = false
     private var isBlockedByScreenState: Boolean = false
+    /** Current-run reference box (may come from saved position prefs). */
     private var referenceSpotRegion: DetectionRegion? = null
+    /**
+     * Session-only snapshot of pixels inside the reference box.
+     * Captured fresh on every Start; recycled on Stop. Never written to disk/prefs.
+     */
     private var referenceSpotBaseline: android.graphics.Bitmap? = null
     @Volatile private var noMineToastShown = false
     private var overlayVisible: Boolean = false
@@ -414,7 +419,10 @@ class MainActivity : ComponentActivity() {
                 },
                 onMineStart = { settings, referenceRegion ->
                     miningSettings = settings
+                    // New run: drop any previous session image before capturing a fresh one.
+                    discardReferenceSpotImage()
                     referenceSpotRegion = referenceRegion
+                    // Position-only is persisted by OverlayController; never persist the image.
                     lifecycleScope.launch { profileStore.saveMiningSettings(settings) }
                     startMining(settings)
                 },
@@ -521,13 +529,8 @@ class MainActivity : ComponentActivity() {
                 return
             }
         }
-        referenceSpotBaseline?.let { runCatching { it.recycle() } }
-        referenceSpotBaseline = null
-        referenceSpotRegion?.let { region ->
-            referenceSpotBaseline = runCatching {
-                captureService?.captureRegionBitmap(region)
-            }.getOrNull()
-        }
+        // Capture what is inside the box RIGHT NOW for this Start only.
+        captureFreshReferenceSpotBaseline()
         isBlockedByScreenState = false
         isRunningState = true
         noMineToastShown = false
@@ -704,7 +707,34 @@ class MainActivity : ComponentActivity() {
         settings.drillDetection || settings.killSpiders || hasRockRegions() ||
             hasNoMineRegion() || hasFireRegion() || referenceSpotRegion != null
 
-    /** True when the reference spot still matches its captured baseline (>= 90% similar). */
+    /** Drop the session reference image only — saved box position in prefs is untouched. */
+    private fun discardReferenceSpotImage() {
+        referenceSpotBaseline?.let { runCatching { it.recycle() } }
+        referenceSpotBaseline = null
+    }
+
+    /**
+     * Snapshot the current screen inside [referenceSpotRegion] for this Start instance.
+     * Always replaces any previous baseline; never loads an image from storage.
+     */
+    private fun captureFreshReferenceSpotBaseline() {
+        discardReferenceSpotImage()
+        val region = referenceSpotRegion ?: return
+        val capture = captureService ?: return
+        if (!capture.isCaptureReady()) return
+        // No display refresh here — restarting the virtual display can hand back a black
+        // first frame, which would poison the baseline and false-trigger the watcher.
+        repeat(3) { attempt ->
+            val bmp = runCatching { capture.captureRegionBitmap(region) }.getOrNull()
+            if (bmp != null) {
+                referenceSpotBaseline = bmp
+                return
+            }
+            if (attempt < 2) Thread.sleep(80)
+        }
+    }
+
+    /** True when the reference spot still matches this Start's baseline (>= 90% similar). */
     private fun isReferenceSpotIntact(): Boolean {
         val region = referenceSpotRegion ?: return true
         val baseline = referenceSpotBaseline ?: return true
@@ -755,9 +785,12 @@ class MainActivity : ComponentActivity() {
         return last
     }
 
+    /** Single fast frame — mining poll loop already retries every ~40ms. */
     private fun isRockPresentForMining(attackDir: String): Boolean {
         val region = rockRegionForAttack(attackDir) ?: return false
-        return scanRockInRegion(region)?.detected == true
+        val capture = captureService ?: return false
+        if (!capture.isCaptureReady()) return false
+        return runCatching { capture.scanRockColorsRegionFast(region).detected }.getOrDefault(false)
     }
 
     private fun isRockPresent(side: String): Boolean =
@@ -812,7 +845,8 @@ class MainActivity : ComponentActivity() {
         val region = playerHealthHitRegion() ?: return false
         val capture = captureService ?: return false
         if (!capture.isCaptureReady()) return false
-        return runCatching { capture.regionHasHealthHitSignal(region) }.getOrDefault(false)
+        // Fast path — post-rock spider watch needs near-instant HP reads.
+        return runCatching { capture.regionHasHealthHitSignalFast(region) }.getOrDefault(false)
     }
 
     private fun fireDetectionRegion(): com.antijail.overlay.model.DetectionRegion? =
@@ -822,11 +856,9 @@ class MainActivity : ComponentActivity() {
         val region = fireDetectionRegion() ?: return false
         val capture = captureService ?: return false
         if (!capture.isCaptureReady()) return false
-        val detected = runCatching { capture.regionHasFireSignal(region) }.getOrDefault(false)
-        if (detected) {
-            runOnUiThread { overlayController?.showMacroToast("Mine collapsing!") }
-        }
-        return detected
+        // Toast comes from the escape sequence ("Mine collapsing… escaping") so a detect-only
+        // frame never looks like the macro stopped without escaping.
+        return runCatching { capture.regionHasFireSignal(region) }.getOrDefault(false)
     }
 
     private fun isBatteryLandmarkVisible(): Boolean {
@@ -846,15 +878,32 @@ class MainActivity : ComponentActivity() {
     private fun spiderAreaRegion(): com.antijail.overlay.model.DetectionRegion? =
         scaledSetupLayout().spiderAreaRegion()
 
+    /**
+     * Slight upward expand so UP spiders near the top edge still count, without pulling in
+     * so much ground that direction votes aim at dirt.
+     */
+    private fun spiderAreaRegionForDetect(): com.antijail.overlay.model.DetectionRegion? {
+        val base = spiderAreaRegion() ?: return null
+        val h = (base.bottom - base.top).coerceAtLeast(1f)
+        val expandUp = h * 0.15f
+        return DetectionRegion(
+            left = base.left,
+            top = (base.top - expandUp).coerceAtLeast(0f),
+            right = base.right,
+            bottom = base.bottom
+        )
+    }
+
     private fun detectSpiderCluster(): com.antijail.overlay.model.SpiderClusterResult? {
-        val region = spiderAreaRegion() ?: return null
+        val region = spiderAreaRegionForDetect() ?: return null
         val capture = captureService ?: return null
         if (!capture.isCaptureReady()) return null
-        return runCatching { capture.scanSpiderCluster(region) }.getOrNull()
+        // Fast frame grab + strict cluster thresholds — real spider only, not ground flecks.
+        return runCatching { capture.scanSpiderClusterFast(region) }.getOrNull()
     }
 
     private fun isSpiderClusterAlive(): Boolean {
-        val region = spiderAreaRegion() ?: return false
+        val region = spiderAreaRegionForDetect() ?: return false
         val capture = captureService ?: return false
         if (!capture.isCaptureReady()) return false
         return runCatching { capture.isSpiderAliveColor(region) }.getOrDefault(false)
@@ -922,12 +971,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Remove the reference-spot overlay and drop its captured baseline (macro fully stopped). */
+    /**
+     * Macro fully stopped: hide the outline and discard this run's image.
+     * Does NOT clear [UiPreferences.lastReferenceSpot] — position stays for next Proceed.
+     */
     private fun clearReferenceSpot() {
         overlayController?.hideReferenceSpot()
         referenceSpotRegion = null
-        referenceSpotBaseline?.let { runCatching { it.recycle() } }
-        referenceSpotBaseline = null
+        discardReferenceSpotImage()
     }
 
     private fun startEditFlow(baseProfile: ActionProfile) {
