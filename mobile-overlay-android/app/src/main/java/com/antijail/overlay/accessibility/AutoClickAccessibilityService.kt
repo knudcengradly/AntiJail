@@ -162,6 +162,9 @@ class AutoClickAccessibilityService : AccessibilityService() {
 
     }
 
+    /** Device Back — used by location-3 return-to-game before resuming mining. */
+    fun pressBack(): Boolean = performGlobalAction(GLOBAL_ACTION_BACK)
+
 
 
     companion object {

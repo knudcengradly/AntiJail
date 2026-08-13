@@ -21,10 +21,10 @@ import kotlin.math.min
 class MiningEngine {
     private var loopJob: Job? = null
     private var drillWatchJob: Job? = null
+    private var hpWatchJob: Job? = null
     private var referenceSpotWatchJob: Job? = null
     private var fireWatchJob: Job? = null
     private var textWatchJob: Job? = null
-    private var postRockSpiderWatchJob: Job? = null
     private var engineScope: CoroutineScope? = null
     private var referenceSpotDetector: (() -> Boolean)? = null
     /** Set by the background fire watcher; consumed by the mining loop (instant read). */
@@ -39,6 +39,8 @@ class MiningEngine {
      */
     @Volatile private var recoveryGesturesAllowed = false
     @Volatile private var spiderCombatActive = false
+    /** Player HP hit confirmed — no-drill must stay paused until clear / hard timeout. */
+    @Volatile private var spiderThreatActive = false
     @Volatile private var fireSequenceActive = false
     @Volatile private var batterySequenceActive = false
     @Volatile private var foodPauseActive = false
@@ -46,15 +48,12 @@ class MiningEngine {
     @Volatile private var detectionCooldownUntilMs = 0L
     @Volatile private var initialStartDelayPending = false
     @Volatile private var skipPreAttackDelayOnce = false
-    /** Post-rock / spider resume — skip one normal attack cycle's drill checks. */
+    /** Rare sticky suppress — prefer [drillPauseUntilMs] / [spiderThreatActive]. */
     @Volatile private var drillChecksSuppressed = false
     /**
-     * After a successful rock mine, keep no-drill / reference-spot paused until this elapsed-realtime
-     * so a spider covering the drill can't false-trigger recovery before/after the direction switch.
+     * Timed no-drill pause (combat grace, location resume). Auto-lifts; never used for rock mines.
      */
-    @Volatile private var postRockSuppressUntilMs = 0L
-    /** Bumped each post-rock watch start so a cancelled job cannot clear the new suppress window. */
-    @Volatile private var postRockWatchGeneration = 0
+    @Volatile private var drillPauseUntilMs = 0L
     private var drillMissStreak = 0
     private var onFoodResumingToast: (() -> Unit)? = null
     private var onSpiderCombatToast: (() -> Unit)? = null
@@ -62,6 +61,7 @@ class MiningEngine {
     private var onFireExtinguishToast: (() -> Unit)? = null
     private var onBatteryDeadToast: (() -> Unit)? = null
     private var batteryShopImageLocator: (suspend (BatteryShopImage) -> Point?)? = null
+    private var gameTextTapLocator: (suspend (String) -> Point?)? = null
     private var batteryLandmarkDetector: (() -> Boolean)? = null
     private var thriftShopDetector: (() -> Boolean)? = null
     private var onBatteryLandmarkFailed: (() -> Unit)? = null
@@ -69,6 +69,14 @@ class MiningEngine {
     private var onPlayDrillAlarm: (() -> Unit)? = null
     private var miningTextScanner: (suspend () -> TextDetection.MiningTextScanResult)? = null
     private var activeSettings: MiningSettings = MiningSettings()
+    /** Up/Down Graal-return flick duration (Fix Setup + Loc 4–6). */
+    @Volatile private var graalReturnFlickMs: Long = GRAAL_RETURN_DPAD_FLICK_DEFAULT_MS
+    /**
+     * After return-to-mine for Loc 4–6: count attacks until a rock is mined.
+     * Armed on resume after collapse / battery / home; cleared on first rock.
+     */
+    @Volatile private var postReturnNoRockWatchActive = false
+    @Volatile private var postReturnAttacksWithoutRock = 0
 
     private companion object {
         private const val ANTIJAIL_DRAG_DURATION_MS = 350L
@@ -119,6 +127,27 @@ class MiningEngine {
         private const val MINE_COLLAPSE_STEP_DELAY_MS = GESTURE_STEP_DELAY_MS
         /** Gap between mining-location walk steps after return-to-mine. */
         private const val MINING_LOCATION_STEP_DELAY_MS = 100L
+        /** Loc 4–6 / Fix Setup: default Up/Down flick if prefs not synced yet. */
+        private const val GRAAL_RETURN_DPAD_FLICK_DEFAULT_MS = 150L
+        private const val GRAAL_RETURN_PRE_FLICK_WAIT_MS = 1_000L
+        /** Before the short Up flick: hold Down for 1s, then settle. */
+        private const val GRAAL_RETURN_PRE_DOWN_DRAG_MS = 1_000L
+        private const val GRAAL_RETURN_POST_DOWN_DRAG_WAIT_MS = 500L
+        private const val GRAAL_RETURN_POST_UP_FLICK_WAIT_MS = 1_000L
+        private const val GRAAL_RETURN_POST_BACK_WAIT_MS = 1_000L
+        /** After tapping Graal: poll this long for a Reconnect button. */
+        private const val GRAAL_RETURN_RECONNECT_WINDOW_MS = 7_000L
+        private const val GRAAL_RETURN_RECONNECT_POLL_MS = 700L
+        /** Extra settle after tapping Reconnect (if it appeared). */
+        private const val GRAAL_RETURN_POST_RECONNECT_WAIT_MS = 5_000L
+        /** After reconnect wait (7s or 5s): L↔R adjust before the final Down flick. */
+        private const val GRAAL_RETURN_PRE_DOWN_FLICK_GAP_MS = 100L
+        private const val GRAAL_RETURN_LEFT_TO_RIGHT_MS = 300L
+        private const val GRAAL_RETURN_RIGHT_TO_LEFT_MS = 500L
+        private const val GRAAL_RETURN_TEXT_POLL_MS = 250L
+        private const val GRAAL_RETURN_TEXT_TIMEOUT_MS = 5_000L
+        private const val GRAAL_RETURN_PHRASE = "graal"
+        private const val GRAAL_RETURN_RECONNECT_PHRASE = "reconnect"
         private const val MOVEMENT_SETTLE_MS = 300L
         private const val ATTACK_HOLD_MS = 200L
         private const val MOVEMENT_HOLD_MS = 50L
@@ -127,6 +156,8 @@ class MiningEngine {
         private const val MINING_LEVEL_CLICK_DEDUCT_SEC = 0.075f
         /** Safety cap if rock boxes are misaligned and template never matches. */
         private const val MAX_ATTACKS_WITHOUT_ROCK = 50
+        /** Loc 4–6: after return-to-mine, re-run Graal setup if no rock in this many attacks. */
+        private const val POST_RETURN_NO_ROCK_ATTACK_LIMIT = 10
         /** Tight rock poll — mining loop only; keep near real-time after each click. */
         private const val ROCK_DETECTION_POLL_MS = 40L
         /** Short settle after attack before rock colour can appear (was 700ms — too late vs spiders). */
@@ -143,24 +174,15 @@ class MiningEngine {
         private const val DRILL_PRE_TAP_POLL_MS = 50L
         /** No-drill must persist this long (quick re-confirm) before recovery fires. */
         private const val DRILL_LOSS_CONFIRM_MS = 50L
-        /**
-         * Minimum post-rock window for spider watch + no-drill suppression when Kill spiders is on.
-         * Direction switch still uses gear [rockMinedDelaySeconds]; this floor only keeps no-drill
-         * paused and keeps looking for HP+spider (including after the switch) so a late spawn
-         * can't false-trigger no-drill while covering the drill.
-         */
-        /** Post-rock no-drill pause + spider watch (UP spiders often linger ~1–2s). */
-        private const val POST_ROCK_SPIDER_WATCH_MIN_MS = 2_500L
-        /**
-         * Hard cap on post-rock spider watch. Without this, HP false-positives could extend
-         * the watch forever and leave no-drill paused indefinitely.
-         */
-        private const val POST_ROCK_SPIDER_WATCH_MAX_MS = 8_000L
-        /** Tight post-rock HP poll — background only, not on mining timing path. */
-        private const val POST_ROCK_SPIDER_POLL_MS = 50L
+        /** Always-on player HP poll — pauses no-drill and starts spider kill (not rock-gated). */
+        private const val HP_WATCH_POLL_MS = 500L
+        /** Hard cap so false HP cannot pause no-drill forever. */
+        private const val SPIDER_THREAT_MAX_MS = 8_000L
+        /** Brief settle after combat before no-drill resumes. */
+        private const val SPIDER_POST_COMBAT_GRACE_MS = 400L
         /** Consecutive HP hits required before starting combat (filters flaky frames). */
         private const val HP_CONFIRM_HITS = 2
-        /** Consecutive HP misses required before ending combat / lifting post-rock pause. */
+        /** Consecutive HP misses required before ending combat / lifting threat pause. */
         private const val HP_CLEAR_MISSES = 3
         private const val HP_CONFIRM_GAP_MS = 40L
         /** Reference-spot background check cadence — independent of mining timings. */
@@ -174,6 +196,14 @@ class MiningEngine {
     }
 
     fun isRunning() = loopJob?.isActive == true
+
+    /** Sync Up/Down Graal flick duration from settings (seconds, e.g. 0.15). */
+    fun setGraalReturnFlickSeconds(seconds: Float) {
+        graalReturnFlickMs = (seconds.coerceIn(0.05f, 5f) * 1000f).toLong()
+            .coerceAtLeast(50L)
+    }
+
+    private fun graalFlickMs(): Long = graalReturnFlickMs.coerceAtLeast(50L)
 
     fun start(
         settings: MiningSettings,
@@ -203,6 +233,7 @@ class MiningEngine {
         onFireExtinguishToast: () -> Unit = {},
         onBatteryDeadToast: () -> Unit = {},
         batteryShopImageLocator: suspend (BatteryShopImage) -> Point? = { null },
+        gameTextTapLocator: suspend (String) -> Point? = { null },
         batteryLandmarkDetector: () -> Boolean = { false },
         onBatteryLandmarkFailed: () -> Unit = {},
         thriftShopDetector: () -> Boolean = { false },
@@ -216,20 +247,23 @@ class MiningEngine {
         initialStartDelayPending = true
         skipPreAttackDelayOnce = true
         drillChecksSuppressed = false
-        postRockSuppressUntilMs = 0L
+        drillPauseUntilMs = 0L
         spiderCombatActive = false
+        spiderThreatActive = false
         fireSequenceActive = false
         batterySequenceActive = false
         fireSeen = false
         batteryDeadSeen = false
         noMineSeen = false
         drillMissStreak = 0
+        clearPostReturnNoRockWatch()
         this.onFoodResumingToast = onFoodResumingToast
         this.onSpiderCombatToast = onSpiderCombatToast
         this.onSpiderEatToast = onSpiderEatToast
         this.onFireExtinguishToast = onFireExtinguishToast
         this.onBatteryDeadToast = onBatteryDeadToast
         this.batteryShopImageLocator = batteryShopImageLocator
+        this.gameTextTapLocator = gameTextTapLocator
         this.batteryLandmarkDetector = batteryLandmarkDetector
         this.onBatteryLandmarkFailed = onBatteryLandmarkFailed
         this.thriftShopDetector = thriftShopDetector
@@ -262,6 +296,19 @@ class MiningEngine {
             } finally {
                 loopJob = null
                 onStopped()
+            }
+        }
+        hpWatchJob = scope.launch {
+            try {
+                runHpWatchLoop(
+                    settings,
+                    layoutProvider,
+                    canRunProvider,
+                    healthHitDetector,
+                    spiderClusterDetector
+                )
+            } finally {
+                hpWatchJob = null
             }
         }
         drillWatchJob = scope.launch {
@@ -322,15 +369,19 @@ class MiningEngine {
         fireSequenceActive = false
         batterySequenceActive = false
         spiderCombatActive = false
+        spiderThreatActive = false
         drillChecksSuppressed = false
-        postRockSuppressUntilMs = 0L
+        drillPauseUntilMs = 0L
         detectionCooldownUntilMs = 0L
         initialStartDelayPending = false
         skipPreAttackDelayOnce = false
         fireSeen = false
         batteryDeadSeen = false
         noMineSeen = false
+        clearPostReturnNoRockWatch()
         AutoClickAccessibilityService.instance?.cancelPendingGestures()
+        hpWatchJob?.cancel()
+        hpWatchJob = null
         drillWatchJob?.cancel()
         drillWatchJob = null
         referenceSpotWatchJob?.cancel()
@@ -339,8 +390,6 @@ class MiningEngine {
         fireWatchJob = null
         textWatchJob?.cancel()
         textWatchJob = null
-        postRockSpiderWatchJob?.cancel()
-        postRockSpiderWatchJob = null
         loopJob?.cancel()
         loopJob = null
         engineScope = null
@@ -358,28 +407,29 @@ class MiningEngine {
     }
 
     /**
-     * True while post-rock spider window is active, drill checks are explicitly paused,
-     * or an emergency escape is pending/running — so no-drill / reference-spot cannot
-     * stop the macro before fire/battery escape+return runs.
+     * True while spider HP threat / combat, timed combat grace, sticky suppress,
+     * or fire/battery escape is active — never paused solely because a rock was mined.
      */
     private fun isDrillWatchPaused(): Boolean =
         drillChecksSuppressed ||
+            spiderThreatActive ||
+            spiderCombatActive ||
             fireSeen ||
             batteryDeadSeen ||
             fireSequenceActive ||
             batterySequenceActive ||
-            SystemClock.elapsedRealtime() < postRockSuppressUntilMs
+            SystemClock.elapsedRealtime() < drillPauseUntilMs
 
     /** Timed no-drill pause only — auto-lifts at [untilMs] (no sticky forever flag). */
     private fun pauseDrillUntil(untilMs: Long) {
-        postRockSuppressUntilMs = maxOf(postRockSuppressUntilMs, untilMs)
+        drillPauseUntilMs = maxOf(drillPauseUntilMs, untilMs)
         drillChecksSuppressed = false
     }
 
-    /** Always lift no-drill pause. Prefer this over leaving [drillChecksSuppressed] stuck true. */
+    /** Always lift timed/sticky no-drill pause (does not clear [spiderThreatActive]). */
     private fun clearDrillPause() {
         drillChecksSuppressed = false
-        postRockSuppressUntilMs = 0L
+        drillPauseUntilMs = 0L
     }
 
     private suspend fun cancelGesturesAndSettle() {
@@ -509,9 +559,8 @@ class MiningEngine {
     )
 
     /**
-     * After each attack: wait 0.7s, poll rock up to 2s (then switch on the gear-set wait).
-     * Strict timing — only the fast rock colour poll runs inline. Battery-dead / no-mine come
-     * from the background text watcher flags (instant reads, no OCR in the timing path).
+     * After each attack: poll rock for direction switch only. Does not pause no-drill —
+     * spider/HP ownership lives in [runHpWatchLoop].
      */
     private suspend fun pollAfterAttack(
         totalMs: Long,
@@ -524,12 +573,6 @@ class MiningEngine {
         val deadline = startedAt + totalMs
         val detectStart = startedAt + ROCK_POST_ATTACK_DELAY_MS
         val rockScanEnd = detectStart + ROCK_DETECTION_WINDOW_MS
-
-        // Timed pause only for the rock window (never sticky — sticky was pausing no-drill forever).
-        if (useRockDetection) {
-            drillMissStreak = 0
-            pauseDrillUntil(rockScanEnd)
-        }
 
         while (SystemClock.elapsedRealtime() < deadline && !stopRequested && canRunProvider()) {
             waitIfFoodPaused()
@@ -545,9 +588,6 @@ class MiningEngine {
                 if (useRockDetection && now < rockScanEnd) {
                     if (rockDetector(attackDir)) {
                         drillMissStreak = 0
-                        pauseDrillUntil(
-                            SystemClock.elapsedRealtime() + POST_ROCK_SPIDER_WATCH_MIN_MS
-                        )
                         return PostAttackPollResult(
                             rockFound = true,
                             noMineAtEnd = false,
@@ -705,8 +745,8 @@ class MiningEngine {
         // Halt mining first so an in-flight attack can't land after the taunt pause.
         stopRequested = true
         AutoClickAccessibilityService.instance?.cancelPendingGestures()
-        postRockSpiderWatchJob?.cancel()
-        postRockSpiderWatchJob = null
+        hpWatchJob?.cancel()
+        hpWatchJob = null
         fireWatchJob?.cancel()
         fireWatchJob = null
         textWatchJob?.cancel()
@@ -730,13 +770,8 @@ class MiningEngine {
     }
 
     /**
-     * Standalone no-drill watch. Independent of the attack loop — polls the drill box every
-     * [DRILL_POLL_INTERVAL_MS]. On a suspected no-drill it re-confirms for [DRILL_LOSS_CONFIRM_MS]
-     * (50ms) then runs recovery immediately. Always respects
-     * suppression (post-rock spider window, spider combat, eating, fire, battery, cooldown) so a
-     * spider covering the player after a successful rock can't false-trigger it during the watch window.
-     * When the watch ends with no spider signals, suppression clears so no-drill runs in parallel with
-     * the direction switch.
+     * Standalone no-drill watch. Polls every [DRILL_POLL_INTERVAL_MS]. Skips while HP threat,
+     * spider combat, eat, fire, or battery own the screen — never paused for rock mines.
      */
     private suspend fun runDrillWatchLoop(
         settings: MiningSettings,
@@ -763,7 +798,8 @@ class MiningEngine {
      * Background reference-spot watch. Every [REFERENCE_SPOT_POLL_MS] it checks whether the captured
      * spot still matches (detector true = intact). Runs on its own coroutine so it never affects
      * mining timings or other detections, and is suppressed during spider/eat/fire/battery/home/cooldown
-     * exactly like no-drill. On a re-confirmed mismatch it runs the no-drill recovery, then stops.
+     * Skips while HP threat / combat / eat / fire / battery (same gates as no-drill).
+     * On a re-confirmed mismatch it runs the no-drill recovery, then stops.
      */
     private suspend fun runReferenceSpotWatchLoop(
         layoutProvider: () -> SetupLayout,
@@ -848,8 +884,8 @@ class MiningEngine {
         // Halt mining first so an in-flight attack can't land after the taunt pause.
         stopRequested = true
         AutoClickAccessibilityService.instance?.cancelPendingGestures()
-        postRockSpiderWatchJob?.cancel()
-        postRockSpiderWatchJob = null
+        hpWatchJob?.cancel()
+        hpWatchJob = null
         fireWatchJob?.cancel()
         fireWatchJob = null
         textWatchJob?.cancel()
@@ -895,8 +931,6 @@ class MiningEngine {
         if (stopRequested) return false
         val skipPreDelay = skipPreAttackDelayOnce
         if (skipPreDelay) skipPreAttackDelayOnce = false
-        val clearDrillSuppressionAfterAttack = drillChecksSuppressed
-
         try {
             if (settings.moveWhenStationary) {
                 if (!skipPreDelay && !delayUnlessStopped(GestureDelays.PRE_ACTION_MS)) return false
@@ -907,10 +941,10 @@ class MiningEngine {
             service.tap(attackPoint(attackDir, layout), holdMs = ATTACK_HOLD_MS)
             return true
         } finally {
-            // Timed pause owns post-rock windows; never leave sticky suppression on after a tap.
-            if (clearDrillSuppressionAfterAttack &&
-                postRockSpiderWatchJob?.isActive != true &&
-                SystemClock.elapsedRealtime() >= postRockSuppressUntilMs
+            if (drillChecksSuppressed &&
+                !spiderThreatActive &&
+                !spiderCombatActive &&
+                SystemClock.elapsedRealtime() >= drillPauseUntilMs
             ) {
                 drillChecksSuppressed = false
             }
@@ -1173,7 +1207,7 @@ class MiningEngine {
     ): Boolean {
         if (stopRequested) return false
         return when (activeSettings.miningLocation.coerceIn(1, 6)) {
-            1, 2, 3, 4, 5 -> runMiningLocationSequence(
+            1, 2, 3, 4, 5, 6 -> runMiningLocationSequence(
                 service,
                 layout,
                 activeSettings.miningLocation.coerceIn(1, 6)
@@ -1211,7 +1245,24 @@ class MiningEngine {
         service.tap(dpadPoint("UP", layout), holdMs = MOVEMENT_HOLD_MS)
         skipPreAttackDelayOnce = true
         pauseDrillUntil(SystemClock.elapsedRealtime() + SPIDER_RESUME_GAP_MS)
+        armPostReturnNoRockWatch()
         return delayUnlessStopped(SPIDER_RESUME_GAP_MS)
+    }
+
+    /** Loc 4–6 only: start counting attacks until the first successful rock mine. */
+    private fun armPostReturnNoRockWatch() {
+        val loc = activeSettings.miningLocation.coerceIn(1, 6)
+        if (loc in 4..6) {
+            postReturnNoRockWatchActive = true
+            postReturnAttacksWithoutRock = 0
+        } else {
+            clearPostReturnNoRockWatch()
+        }
+    }
+
+    private fun clearPostReturnNoRockWatch() {
+        postReturnNoRockWatchActive = false
+        postReturnAttacksWithoutRock = 0
     }
 
     private suspend fun runMiningLocationSequence(
@@ -1244,14 +1295,120 @@ class MiningEngine {
                 if (!locationDpadMove(service, layout, "UP", "DOWN", 5_000L)) return false
                 if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 1_000L)) return false
                 if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 2_500L)) return false
-                if (!locationDpadMove(service, layout, "UP", "DOWN", 1_300L)) return false
+                if (!locationDpadMove(service, layout, "UP", "DOWN", 2_000L)) return false
+                return runGraalReturnToGame(service, layout, resumeMining = true)
             }
             5 -> {
                 if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 5_000L)) return false
-                if (!locationDpadMove(service, layout, "UP", "LEFT", 2_300L)) return false
+                if (!locationDpadMove(service, layout, "UP", "LEFT", 2_000L)) return false
+                return runGraalReturnToGame(service, layout, resumeMining = true)
+            }
+            6 -> {
+                if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 800L)) return false
+                if (!locationDpadMove(service, layout, "UP", "DOWN", 1_000L)) return false
+                if (!locationDpadMove(service, layout, "UP", "LEFT", 5_000L)) return false
+                return runGraalReturnToGame(service, layout, resumeMining = true)
             }
         }
         return resumeMiningAfterLocation(service, layout)
+    }
+
+    /**
+     * Shared Back → tap "Graal" → optional Reconnect → flick sequence.
+     * Loc 4–6 / Fix Setup / no-rock re-run: wait 1s → Down 1s → wait 0.5s → Up flick → …
+     */
+    private suspend fun runGraalReturnToGame(
+        service: AutoClickAccessibilityService,
+        layout: SetupLayout,
+        resumeMining: Boolean
+    ): Boolean {
+        if (!delayUnlessStopped(GRAAL_RETURN_PRE_FLICK_WAIT_MS)) return false
+        if (!locationDpadMove(service, layout, "UP", "DOWN", GRAAL_RETURN_PRE_DOWN_DRAG_MS)) return false
+        if (!delayUnlessStopped(GRAAL_RETURN_POST_DOWN_DRAG_WAIT_MS)) return false
+        if (!locationDpadMove(service, layout, "DOWN", "UP", graalFlickMs())) return false
+        if (!delayUnlessStopped(GRAAL_RETURN_POST_UP_FLICK_WAIT_MS)) return false
+        if (!ensureRunning()) return false
+        service.pressBack()
+        if (!delayUnlessStopped(GRAAL_RETURN_POST_BACK_WAIT_MS)) return false
+
+        val tap = waitForGameTextTap(GRAAL_RETURN_PHRASE, GRAAL_RETURN_TEXT_TIMEOUT_MS)
+        if (tap != null) {
+            if (!ensureRunning()) return false
+            awaitTap(service, tap, holdMs = 50L)
+        }
+        if (!waitAfterGraalForReconnectOrTimeout(service)) return false
+        // After 7s reconnect poll (or 5s post-reconnect): L→R / R→L, then Down flick.
+        if (!delayUnlessStopped(GRAAL_RETURN_PRE_DOWN_FLICK_GAP_MS)) return false
+        if (!locationDpadMove(service, layout, "LEFT", "RIGHT", GRAAL_RETURN_LEFT_TO_RIGHT_MS)) return false
+        if (!delayUnlessStopped(GRAAL_RETURN_PRE_DOWN_FLICK_GAP_MS)) return false
+        if (!locationDpadMove(service, layout, "RIGHT", "LEFT", GRAAL_RETURN_RIGHT_TO_LEFT_MS)) return false
+        if (!delayUnlessStopped(GRAAL_RETURN_PRE_DOWN_FLICK_GAP_MS)) return false
+        if (!locationDpadMove(service, layout, "UP", "DOWN", graalFlickMs())) return false
+        return if (resumeMining) {
+            resumeMiningAfterLocation(service, layout)
+        } else {
+            true
+        }
+    }
+
+    /**
+     * For up to 7s after Graal: every 0.7s look for "reconnect".
+     * If found → click → wait 5s. If never found → continue toward Down flick.
+     */
+    private suspend fun waitAfterGraalForReconnectOrTimeout(
+        service: AutoClickAccessibilityService
+    ): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + GRAAL_RETURN_RECONNECT_WINDOW_MS
+        while (SystemClock.elapsedRealtime() < deadline && allowsEngineWork()) {
+            val reconnect = pollGameTextTapOnce(GRAAL_RETURN_RECONNECT_PHRASE)
+            if (reconnect != null) {
+                if (!ensureRunning()) return false
+                awaitTap(service, reconnect, holdMs = 50L)
+                return delayUnlessStopped(GRAAL_RETURN_POST_RECONNECT_WAIT_MS)
+            }
+            val left = deadline - SystemClock.elapsedRealtime()
+            if (left <= 0) break
+            if (!delayUnlessStopped(min(GRAAL_RETURN_RECONNECT_POLL_MS, left))) return false
+        }
+        return allowsEngineWork()
+    }
+
+    private suspend fun pollGameTextTapOnce(phrase: String): Point? {
+        val locator = gameTextTapLocator ?: return null
+        return runCatching { locator(phrase) }.getOrNull()
+    }
+
+    /**
+     * Settings → Fix Setup: same Graal return flicks without resuming mining.
+     * Safe while the mining loop is stopped (uses recovery gesture allowance).
+     */
+    suspend fun runFixSetupSequence(
+        layoutProvider: () -> SetupLayout,
+        gameTextTapLocator: suspend (String) -> Point?
+    ): Boolean {
+        val service = AutoClickAccessibilityService.instance ?: return false
+        val previousLocator = this.gameTextTapLocator
+        this.gameTextTapLocator = gameTextTapLocator
+        recoveryGesturesAllowed = true
+        try {
+            return runGraalReturnToGame(service, layoutProvider(), resumeMining = false)
+        } finally {
+            this.gameTextTapLocator = previousLocator
+            recoveryGesturesAllowed = false
+        }
+    }
+
+    private suspend fun waitForGameTextTap(phrase: String, timeoutMs: Long): Point? {
+        val locator = gameTextTapLocator ?: return null
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline && allowsEngineWork()) {
+            val point = runCatching { locator(phrase) }.getOrNull()
+            if (point != null) return point
+            val left = deadline - SystemClock.elapsedRealtime()
+            if (left <= 0) break
+            if (!delayUnlessStopped(min(GRAAL_RETURN_TEXT_POLL_MS, left))) return null
+        }
+        return null
     }
 
     /** Step 4: long RIGHT→LEFT drag, then colour-gated left/up holds with retry drags. */
@@ -1443,11 +1600,10 @@ class MiningEngine {
     }
 
     /**
-     * After rock is mined: fight when player HP and spider colour are both seen.
-     * When [alreadyConfirmed] is true (post-rock watcher already saw both this frame),
-     * skip a second capture reconfirm so combat starts instantly.
+     * Fight when player HP is confirmed (from always-on HP watch).
+     * When [alreadyConfirmed] is true, skip a second capture reconfirm so combat starts instantly.
      */
-    private suspend fun maybeFightSpiderAfterRock(
+    private suspend fun maybeFightSpider(
         settings: MiningSettings,
         layoutProvider: () -> SetupLayout,
         healthHitDetector: () -> Boolean,
@@ -1462,9 +1618,9 @@ class MiningEngine {
         val service = AutoClickAccessibilityService.instance ?: return false
         val layout = layoutProvider()
         spiderCombatActive = true
+        spiderThreatActive = true
         foodPauseActive = true
         drillMissStreak = 0
-        pauseDrillUntil(SystemClock.elapsedRealtime() + POST_ROCK_SPIDER_WATCH_MIN_MS)
         AutoClickAccessibilityService.instance?.cancelPendingGestures()
         if (stopRequested) {
             spiderCombatActive = false
@@ -1484,8 +1640,7 @@ class MiningEngine {
             spiderCombatActive = false
             foodPauseActive = false
             drillMissStreak = 0
-            // Short timed pause only — sticky true here was leaving no-drill dead forever.
-            pauseDrillUntil(SystemClock.elapsedRealtime() + POST_ROCK_SPIDER_WATCH_MIN_MS)
+            pauseDrillUntil(SystemClock.elapsedRealtime() + SPIDER_POST_COMBAT_GRACE_MS)
             if (!foodSequenceRunning) {
                 detectionCooldownUntilMs =
                     SystemClock.elapsedRealtime() + FOOD_POST_RESUME_DETECTION_DELAY_MS
@@ -1495,130 +1650,97 @@ class MiningEngine {
     }
 
     /**
-     * After a successful rock mine:
-     * - Pause no-drill / reference-spot immediately for at least [POST_ROCK_SPIDER_WATCH_MIN_MS]
-     * - Spider detection + kill run only in a background job (never on the mining timing path)
-     * - Direction switch waits only the gear [rockMinedDelaySeconds] (cheap delay, no capture)
-     * - No-drill resumes after the post-rock window with no spider / no HP-hit left
+     * Always-on HP watch (every [HP_WATCH_POLL_MS]):
+     * - Confirmed player HP → pause no-drill immediately, then kill if enabled
+     * - Not gated on rock mined — works at high mining levels without pause spam
+     * - Hard-stops threat pause by [SPIDER_THREAT_MAX_MS]
      */
-    private suspend fun watchForSpiderAfterRock(
+    private suspend fun runHpWatchLoop(
         settings: MiningSettings,
         layoutProvider: () -> SetupLayout,
         canRunProvider: () -> Boolean,
         healthHitDetector: () -> Boolean,
         spiderClusterDetector: () -> SpiderClusterResult?
-    ): Boolean {
-        drillMissStreak = 0
-        val switchWaitMs = rockMinedDelayMs(settings)
-        // Always keep the old 1.5s no-drill pause after a successful mine (spider often covers drill).
-        val suppressMs = maxOf(switchWaitMs, POST_ROCK_SPIDER_WATCH_MIN_MS)
-        val now = SystemClock.elapsedRealtime()
-        val watchUntil = now + suppressMs
-        val hardStopAt = now + POST_ROCK_SPIDER_WATCH_MAX_MS
-        pauseDrillUntil(watchUntil)
-        val generation = ++postRockWatchGeneration
-
-        postRockSpiderWatchJob?.cancel()
-        val scope = engineScope
-        if (scope != null) {
-            postRockSpiderWatchJob = scope.launch {
-                try {
-                    runPostRockSpiderWatchLoop(
-                        settings,
-                        layoutProvider,
-                        canRunProvider,
-                        healthHitDetector,
-                        spiderClusterDetector,
-                        watchUntil,
-                        hardStopAt
-                    )
-                } finally {
-                    // Always lift pause when this watch generation ends — gating on HP clear
-                    // left no-drill paused forever after false-positive / laggy HP frames.
-                    if (generation == postRockWatchGeneration) {
-                        clearDrillPause()
-                        postRockSpiderWatchJob = null
-                    }
-                }
-            }
-        }
-
-        // Strict gear timing only — no spider/OCR/capture work on the mining thread.
-        val switchDeadline = now + switchWaitMs
-        while (SystemClock.elapsedRealtime() < switchDeadline && !stopRequested && canRunProvider()) {
-            waitIfFoodPaused()
-            if (stopRequested || !canRunProvider()) break
-            val left = switchDeadline - SystemClock.elapsedRealtime()
-            if (left <= 0) break
-            delay(min(50L, left))
-        }
-        return false
-    }
-
-    /**
-     * Background-only post-rock watch (continues through direction switch):
-     * - Keeps no-drill paused via timed [postRockSuppressUntilMs] (never sticky forever)
-     * - Starts combat after HP reconfirm
-     * - Hard-stops by [hardStopAt] so laggy HP cannot pause no-drill forever
-     */
-    private suspend fun runPostRockSpiderWatchLoop(
-        settings: MiningSettings,
-        layoutProvider: () -> SetupLayout,
-        canRunProvider: () -> Boolean,
-        healthHitDetector: () -> Boolean,
-        spiderClusterDetector: () -> SpiderClusterResult?,
-        untilMs: Long,
-        hardStopAt: Long
     ) {
-        var deadline = untilMs
         while (!stopRequested && canRunProvider()) {
-            val now = SystemClock.elapsedRealtime()
-            if (now >= hardStopAt) break
-
-            if (fireSequenceActive || batterySequenceActive || foodSequenceRunning) {
-                delay(POST_ROCK_SPIDER_POLL_MS)
-                continue
-            }
-            if (spiderCombatActive) {
-                delay(POST_ROCK_SPIDER_POLL_MS)
-                continue
-            }
+            if (!delayUnlessStopped(HP_WATCH_POLL_MS)) return
+            if (stopRequested || !canRunProvider()) return
+            if (fireSequenceActive || batterySequenceActive || foodSequenceRunning) continue
+            if (spiderCombatActive) continue
 
             val healthHit = runCatching { healthHitDetector() }.getOrDefault(false)
+            if (!healthHit) {
+                if (spiderThreatActive && confirmHealthGone(healthHitDetector)) {
+                    spiderThreatActive = false
+                    clearDrillPause()
+                }
+                continue
+            }
 
-            if (healthHit && settings.killSpiders) {
-                // Timed pause only — extend up to the hard cap.
-                deadline = minOf(hardStopAt, maxOf(deadline, now + POST_ROCK_SPIDER_WATCH_MIN_MS))
-                pauseDrillUntil(deadline)
-                if (confirmHealthHit(healthHitDetector, need = 1)) {
-                    deadline = minOf(
-                        hardStopAt,
-                        maxOf(deadline, SystemClock.elapsedRealtime() + POST_ROCK_SPIDER_WATCH_MIN_MS)
-                    )
-                    pauseDrillUntil(deadline)
-                    maybeFightSpiderAfterRock(
+            // HP seen — pause no-drill before drill watch can false-trigger.
+            spiderThreatActive = true
+            val threatStarted = SystemClock.elapsedRealtime()
+            pauseDrillUntil(threatStarted + SPIDER_THREAT_MAX_MS)
+
+            if (!confirmHealthHit(healthHitDetector, need = 1)) continue
+
+            if (settings.killSpiders) {
+                maybeFightSpider(
+                    settings,
+                    layoutProvider,
+                    healthHitDetector,
+                    spiderClusterDetector,
+                    alreadyConfirmed = true
+                )
+            }
+
+            while (
+                !stopRequested &&
+                canRunProvider() &&
+                SystemClock.elapsedRealtime() < threatStarted + SPIDER_THREAT_MAX_MS
+            ) {
+                if (fireSequenceActive || batterySequenceActive || foodSequenceRunning) {
+                    delay(HP_WATCH_POLL_MS)
+                    continue
+                }
+                if (spiderCombatActive) {
+                    delay(50)
+                    continue
+                }
+                if (confirmHealthGone(healthHitDetector)) break
+                if (settings.killSpiders &&
+                    confirmHealthHit(healthHitDetector, need = 1)
+                ) {
+                    maybeFightSpider(
                         settings,
                         layoutProvider,
                         healthHitDetector,
                         spiderClusterDetector,
                         alreadyConfirmed = true
                     )
-                    deadline = minOf(
-                        hardStopAt,
-                        maxOf(deadline, SystemClock.elapsedRealtime() + POST_ROCK_SPIDER_WATCH_MIN_MS)
-                    )
-                    pauseDrillUntil(deadline)
                     continue
                 }
+                delay(HP_WATCH_POLL_MS)
             }
 
-            if (now >= deadline) {
-                // Prefer clear HP, but never extend past hardStopAt.
-                if (confirmHealthGone(healthHitDetector) || now + 1 >= hardStopAt) break
-                deadline = minOf(hardStopAt, SystemClock.elapsedRealtime() + POST_ROCK_SPIDER_WATCH_MIN_MS)
-                pauseDrillUntil(deadline)
-            }
-            delay(POST_ROCK_SPIDER_POLL_MS)
+            spiderThreatActive = false
+            pauseDrillUntil(SystemClock.elapsedRealtime() + SPIDER_POST_COMBAT_GRACE_MS)
+        }
+    }
+
+    /** Gear-only wait after a successful rock — no spider/no-drill ownership. */
+    private suspend fun waitRockMinedDirectionSwitch(
+        settings: MiningSettings,
+        canRunProvider: () -> Boolean
+    ) {
+        val switchWaitMs = rockMinedDelayMs(settings)
+        val switchDeadline = SystemClock.elapsedRealtime() + switchWaitMs
+        while (SystemClock.elapsedRealtime() < switchDeadline && !stopRequested && canRunProvider()) {
+            waitIfFoodPaused()
+            if (stopRequested || !canRunProvider()) break
+            val left = switchDeadline - SystemClock.elapsedRealtime()
+            if (left <= 0) break
+            delay(min(50L, left))
         }
     }
 
@@ -1682,17 +1804,23 @@ class MiningEngine {
                 continue
             }
             if (postAttack.rockFound) {
-                // Fight any spider that spawned on the freshly mined rock, then always switch
-                // direction. The rock in this direction is already mined, so resuming on the same
-                // direction after a spider kill would hit "nothing here to mine".
-                watchForSpiderAfterRock(
-                    settings,
-                    layoutProvider,
-                    canRunProvider,
-                    healthHitDetector,
-                    spiderClusterDetector
-                )
+                // First successful rock after return-to-mine ends the Loc 4–6 watch.
+                clearPostReturnNoRockWatch()
+                // Direction switch only — spider kill is owned by the always-on HP watch.
+                waitRockMinedDirectionSwitch(settings, canRunProvider)
                 break
+            }
+            if (postReturnNoRockWatchActive) {
+                postReturnAttacksWithoutRock++
+                if (postReturnAttacksWithoutRock >= POST_RETURN_NO_ROCK_ATTACK_LIMIT) {
+                    // No rock after 10 attacks — re-run Graal setup, then resume mining.
+                    clearPostReturnNoRockWatch()
+                    if (!runGraalReturnToGame(service, layoutProvider(), resumeMining = true)) {
+                        return
+                    }
+                    // Watch re-armed in resumeMiningAfterLocation; keep mining.
+                    continue
+                }
             }
             if (postAttack.noMineAtEnd) {
                 noMineSeen = false

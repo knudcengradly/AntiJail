@@ -1008,6 +1008,45 @@ class ScreenCaptureService : Service() {
     suspend fun regionContainsBatteryDeadMessage(region: DetectionRegion): Boolean =
         regionScanMiningText(region).batteryDead
 
+    /**
+     * OCR [phrase] inside [region] and return a screen tap at the match center.
+     * Upscales the crop (same as mining OCR) so Graal UI text is readable.
+     */
+    suspend fun findTextTapPoint(region: DetectionRegion, phrase: String): com.antijail.overlay.model.Point? {
+        val result = withLatestMappedRegion(region) { bitmap, left, top, right, bottom ->
+            val rw = right - left
+            val rh = bottom - top
+            if (rw < 4 || rh < 4) return@withLatestMappedRegion null
+            val cropped = Bitmap.createBitmap(bitmap, left, top, rw, rh)
+            try {
+                val scale = 3
+                val scaled = Bitmap.createScaledBitmap(
+                    cropped,
+                    (rw * scale).coerceAtLeast(1),
+                    (rh * scale).coerceAtLeast(1),
+                    true
+                )
+                try {
+                    val local = TextDetection.findPhraseCenter(scaled, phrase) ?: return@withLatestMappedRegion null
+                    com.antijail.overlay.model.Point(
+                        left + local.x / scale,
+                        top + local.y / scale
+                    )
+                } finally {
+                    if (scaled !== cropped) scaled.recycle()
+                }
+            } finally {
+                cropped.recycle()
+            }
+        }
+        Log.d(
+            TAG,
+            "findTextTapPoint: phrase='$phrase' tap=${result?.let { "(${it.x},${it.y})" } ?: "null"} " +
+                "region=${formatRegion(region)}"
+        )
+        return result
+    }
+
     private fun pixelMatchesSpiderColor(
         r: Int,
         g: Int,

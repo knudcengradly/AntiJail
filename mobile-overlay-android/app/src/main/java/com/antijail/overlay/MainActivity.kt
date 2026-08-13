@@ -51,6 +51,7 @@ import com.antijail.overlay.model.BatteryShopImage
 import com.antijail.overlay.model.SetupTarget
 import com.antijail.overlay.model.UiPreferences
 import com.antijail.overlay.overlay.OverlayController
+import com.antijail.overlay.overlay.OverlayPlayAccent
 import com.antijail.overlay.storage.ProfileStore
 import com.antijail.overlay.storage.SnapshotStorage
 import kotlinx.coroutines.Dispatchers
@@ -87,6 +88,8 @@ class MainActivity : ComponentActivity() {
      */
     private var referenceSpotBaseline: android.graphics.Bitmap? = null
     @Volatile private var noMineToastShown = false
+    @Volatile private var fixSetupRunning = false
+    @Volatile private var playAccent: OverlayPlayAccent = OverlayPlayAccent.IDLE
     private var overlayVisible: Boolean = false
     private var soundMuted: Boolean = false
     private var pendingProjectionResult: Pair<Int, Intent>? = null
@@ -220,6 +223,7 @@ class MainActivity : ComponentActivity() {
                     setupLayout = profileStore.setupLayoutFlow.first()
                     setupProgress = profileStore.setupProgressFlow.first()
                     uiPreferences = profileStore.uiPreferencesFlow.first()
+                    miningEngine.setGraalReturnFlickSeconds(uiPreferences.graalReturnFlickSeconds)
                     profileState = profile
                     refreshPermissionStates()
                 } catch (e: Exception) {
@@ -402,6 +406,7 @@ class MainActivity : ComponentActivity() {
                     panicStopAutomation()
                 },
                 isRunningProvider = { isRunningState },
+                playAccentProvider = { playAccent },
                 isSoundMuted = { soundMuted },
                 onToggleSoundMuted = {
                     soundMuted = !soundMuted
@@ -409,6 +414,7 @@ class MainActivity : ComponentActivity() {
                         alarmSoundPlayer.release()
                     }
                 },
+                onFixSetupRequested = { handleFixSetupRequested() },
                 onPlayPressed = {
                     overlayController?.showModeSelectionOverlay(
                         onMine = { overlayController?.showMiningSettingsOverlay(miningSettings) },
@@ -449,6 +455,7 @@ class MainActivity : ComponentActivity() {
                 uiPreferencesProvider = { uiPreferences },
                 onUiPreferencesChanged = { prefs ->
                     uiPreferences = prefs
+                    miningEngine.setGraalReturnFlickSeconds(prefs.graalReturnFlickSeconds)
                     lifecycleScope.launch { profileStore.saveUiPreferences(prefs) }
                 },
                 onCaptureSnapshot = { region -> captureSnapshotRegion(region) }
@@ -533,7 +540,9 @@ class MainActivity : ComponentActivity() {
         captureFreshReferenceSpotBaseline()
         isBlockedByScreenState = false
         isRunningState = true
+        playAccent = OverlayPlayAccent.MINE
         noMineToastShown = false
+        miningEngine.setGraalReturnFlickSeconds(uiPreferences.graalReturnFlickSeconds)
         overlayController?.refreshPlayState()
         miningEngine.start(
             settings = settings,
@@ -543,6 +552,7 @@ class MainActivity : ComponentActivity() {
             onStopped = {
                 runOnUiThread {
                     isRunningState = false
+                    playAccent = OverlayPlayAccent.IDLE
                     clearReferenceSpot()
                     overlayController?.refreshPlayState()
                 }
@@ -562,6 +572,7 @@ class MainActivity : ComponentActivity() {
             onDrillLost = {
                 runOnUiThread {
                     isRunningState = false
+                    playAccent = OverlayPlayAccent.IDLE
                     overlayController?.refreshPlayState()
                 }
             },
@@ -586,10 +597,12 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread { overlayController?.showMacroToast("Battery dead — escaping") }
             },
             batteryShopImageLocator = { kind -> findBatteryShopImageTapPoint(kind) },
+            gameTextTapLocator = { phrase -> findGameTextTapPoint(phrase) },
             batteryLandmarkDetector = { isBatteryLandmarkVisible() },
             onBatteryLandmarkFailed = {
                 runOnUiThread {
                     isRunningState = false
+                    playAccent = OverlayPlayAccent.IDLE
                     overlayController?.refreshPlayState()
                     overlayController?.showMacroToast("Battery escape failed — macro stopped")
                 }
@@ -598,6 +611,7 @@ class MainActivity : ComponentActivity() {
             onMineCollapseFailed = {
                 runOnUiThread {
                     isRunningState = false
+                    playAccent = OverlayPlayAccent.IDLE
                     overlayController?.refreshPlayState()
                     overlayController?.showMacroToast("Mine escape failed — macro stopped")
                 }
@@ -642,6 +656,7 @@ class MainActivity : ComponentActivity() {
         }
         isBlockedByScreenState = false
         isRunningState = true
+        playAccent = OverlayPlayAccent.FISH
         overlayController?.refreshPlayState()
         overlayController?.showMacroToast("Fish mode — pirate watch active")
         fishEngine.start(
@@ -838,6 +853,13 @@ class MainActivity : ComponentActivity() {
         }.getOrNull()
     }
 
+    private suspend fun findGameTextTapPoint(phrase: String): com.antijail.overlay.model.Point? {
+        val region = scaledSetupLayout().gameAreaRegion() ?: return null
+        val capture = captureService ?: return null
+        if (!capture.isCaptureReady()) return null
+        return runCatching { capture.findTextTapPoint(region, phrase) }.getOrNull()
+    }
+
     private fun playerHealthHitRegion(): com.antijail.overlay.model.DetectionRegion? =
         scaledSetupLayout().spiderHealthRegion()
 
@@ -957,6 +979,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun handleFixSetupRequested() {
+        if (fixSetupRunning) return
+        if (AutoClickAccessibilityService.instance == null) {
+            Toast.makeText(
+                this,
+                "Enable accessibility service in Settings \u2192 Accessibility \u2192 AntiJail",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        fixSetupRunning = true
+        miningEngine.setGraalReturnFlickSeconds(uiPreferences.graalReturnFlickSeconds)
+        overlayController?.setFixSetupHighlight(true)
+        lifecycleScope.launch(Dispatchers.Default) {
+            try {
+                miningEngine.runFixSetupSequence(
+                    layoutProvider = { scaledSetupLayout() },
+                    gameTextTapLocator = { phrase -> findGameTextTapPoint(phrase) }
+                )
+            } finally {
+                fixSetupRunning = false
+                runOnUiThread { overlayController?.setFixSetupHighlight(false) }
+            }
+        }
+    }
+
     private fun panicStopAutomation() {
         miningEngine.stop()
         fishEngine.stop()
@@ -964,6 +1012,7 @@ class MainActivity : ComponentActivity() {
         automationEngine.cancelCurrentAction()
         automationEngine.stop()
         isRunningState = false
+        playAccent = OverlayPlayAccent.IDLE
         clearReferenceSpot()
         overlayController?.hideMacroToast()
         if (overlayVisible) {

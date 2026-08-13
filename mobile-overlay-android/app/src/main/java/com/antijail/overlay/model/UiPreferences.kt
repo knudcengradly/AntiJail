@@ -25,7 +25,13 @@ data class UiPreferences(
      * The pixels inside the box are NEVER saved here — they are captured fresh each Start
      * and discarded when the macro stops.
      */
-    val lastReferenceSpot: DetectionRegion? = null
+    val lastReferenceSpot: DetectionRegion? = null,
+
+    /**
+     * Graal return Up/Down flick duration in seconds (Fix Setup + Loc 4–6).
+     * Decimal allowed (e.g. 0.15).
+     */
+    val graalReturnFlickSeconds: Float = 0.15f
 
 )
 

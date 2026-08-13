@@ -54,6 +54,14 @@ import com.antijail.overlay.model.UiPreferences
 import com.antijail.overlay.model.setupTargetFromSpinnerIndex
 import com.antijail.overlay.model.spinnerIndex
 
+/** Toolbar button accent while a macro is active (idle stays blue). */
+enum class OverlayPlayAccent {
+    IDLE,
+    MINE,
+    FISH,
+    DIG
+}
+
 class OverlayController(
     private val context: Context,
     private val onPlayPause: () -> Unit,
@@ -64,8 +72,10 @@ class OverlayController(
     private val onSaveEdit: () -> Unit,
     private val onCloseOverlay: () -> Unit,
     private val isRunningProvider: () -> Boolean,
+    private val playAccentProvider: () -> OverlayPlayAccent = { OverlayPlayAccent.IDLE },
     private val isSoundMuted: () -> Boolean,
     private val onToggleSoundMuted: () -> Unit,
+    private val onFixSetupRequested: () -> Unit,
     private val onPlayPressed: () -> Unit,
     private val onMineStart: (MiningSettings, DetectionRegion?) -> Unit,
     private val onFishStart: (FishSettings) -> Unit,
@@ -101,6 +111,8 @@ class OverlayController(
     private var isEditMode: Boolean = false
     private var selectedEditTarget: EditTarget = EditTarget.NONE
     private var toolbarOpacity: Float = 1f
+    /** Yellow toolbar shade while Settings → Fix Setup sequence runs. */
+    @Volatile private var fixSetupHighlightActive: Boolean = false
     private val fixedDrillWidth = SetupLayout.DRILL_BOX_WIDTH_PX.toFloat()
     private val fixedDrillHeight = SetupLayout.DRILL_BOX_HEIGHT_PX.toFloat()
 
@@ -124,23 +136,54 @@ class OverlayController(
         val pressedStroke: Int
     )
 
-    /** Blue when idle; green while mining / macro is running. */
-    private fun toolbarButtonColors(): ToolbarButtonColors =
-        if (isRunningProvider()) {
-            ToolbarButtonColors(
-                fill = Color.parseColor("#E0144030"),
-                stroke = Color.parseColor("#66E088"),
-                pressedFill = Color.parseColor("#FF0A2E1F"),
-                pressedStroke = Color.parseColor("#9AF0AA")
+    /**
+     * Idle = blue. Mine running = green. Fish / Fix Setup = yellow. Dig = red.
+     * Matches outline+fill shade (not toolbar background).
+     */
+    private fun toolbarButtonColors(): ToolbarButtonColors {
+        if (fixSetupHighlightActive) {
+            return ToolbarButtonColors(
+                fill = Color.parseColor("#E03A3210"),
+                stroke = Color.parseColor("#F5D76E"),
+                pressedFill = Color.parseColor("#FF2A2208"),
+                pressedStroke = Color.parseColor("#FFE9A0")
             )
-        } else {
-            ToolbarButtonColors(
+        }
+        if (!isRunningProvider()) {
+            return ToolbarButtonColors(
                 fill = Color.parseColor("#E00E2C57"),
                 stroke = Color.parseColor("#74BCFF"),
                 pressedFill = Color.parseColor("#FF0A2345"),
                 pressedStroke = Color.parseColor("#9FD2FF")
             )
         }
+        return when (playAccentProvider()) {
+            OverlayPlayAccent.FISH -> ToolbarButtonColors(
+                fill = Color.parseColor("#E03A3210"),
+                stroke = Color.parseColor("#F5D76E"),
+                pressedFill = Color.parseColor("#FF2A2208"),
+                pressedStroke = Color.parseColor("#FFE9A0")
+            )
+            OverlayPlayAccent.DIG -> ToolbarButtonColors(
+                fill = Color.parseColor("#E03A1418"),
+                stroke = Color.parseColor("#FF6B6B"),
+                pressedFill = Color.parseColor("#FF2A0A0E"),
+                pressedStroke = Color.parseColor("#FF9A9A")
+            )
+            OverlayPlayAccent.MINE -> ToolbarButtonColors(
+                fill = Color.parseColor("#E0144030"),
+                stroke = Color.parseColor("#66E088"),
+                pressedFill = Color.parseColor("#FF0A2E1F"),
+                pressedStroke = Color.parseColor("#9AF0AA")
+            )
+            OverlayPlayAccent.IDLE -> ToolbarButtonColors(
+                fill = Color.parseColor("#E00E2C57"),
+                stroke = Color.parseColor("#74BCFF"),
+                pressedFill = Color.parseColor("#FF0A2345"),
+                pressedStroke = Color.parseColor("#9FD2FF")
+            )
+        }
+    }
 
     private fun circleButtonBackground(colors: ToolbarButtonColors = toolbarButtonColors()): GradientDrawable =
         GradientDrawable().apply {
@@ -282,13 +325,24 @@ class OverlayController(
         updateReferenceSpotRunningColor()
     }
 
-    /** Match toolbar: green outline while macro is running, light-blue while placing. */
+    /** Yellow shade on the overlay toolbar while Fix Setup is running (not for loc return). */
+    fun setFixSetupHighlight(active: Boolean) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { setFixSetupHighlight(active) }
+            return
+        }
+        fixSetupHighlightActive = active
+        if (!isEditMode) rebuildToolbar()
+    }
+
+    /** Match toolbar accent: green mine, yellow fish, red dig, blue idle. */
     private fun updateReferenceSpotRunningColor() {
         val view = referenceSpotBoxView ?: return
-        val stroke = if (isRunningProvider()) {
-            Color.parseColor("#66E088")
-        } else {
-            Color.parseColor("#74BCFF")
+        val stroke = when {
+            !isRunningProvider() -> Color.parseColor("#74BCFF")
+            playAccentProvider() == OverlayPlayAccent.FISH -> Color.parseColor("#F5D76E")
+            playAccentProvider() == OverlayPlayAccent.DIG -> Color.parseColor("#FF6B6B")
+            else -> Color.parseColor("#66E088")
         }
         val bg = view.background as? GradientDrawable
             ?: GradientDrawable().also {
@@ -571,17 +625,73 @@ class OverlayController(
             }
         }
         popup.addView(muteBtn)
+
+        val fixSetupBtn = TextView(context).apply {
+            text = "Fix Setup"
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(18, 12, 18, 12)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 10 }
+            layoutParams = lp
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 14f
+                setColor(Color.parseColor("#88324863"))
+                setStroke(2, Color.parseColor("#74BCFF"))
+            }
+        }
+        popup.addView(fixSetupBtn)
+
+        popup.addView(TextView(context).apply {
+            text = "Flick (s)"
+            setTextColor(Color.parseColor("#B0CFFF"))
+            textSize = 12f
+            setPadding(0, 12, 0, 4)
+        })
+        var draftFlickText = formatDecimalSeconds(
+            uiPreferencesProvider().graalReturnFlickSeconds.coerceAtLeast(0.05f)
+        )
+        fun commitFlickFromDraft() {
+            val seconds = parseDecimalSeconds(draftFlickText, 0.15f).coerceIn(0.05f, 5f)
+            draftFlickText = formatDecimalSeconds(seconds)
+            onUiPreferencesChanged(
+                uiPreferencesProvider().copy(graalReturnFlickSeconds = seconds)
+            )
+        }
+        popup.addView(
+            buildNumberInput("0.15", draftFlickText, allowDecimal = true) { text ->
+                draftFlickText = text
+                if (text.trim().replace(',', '.').toFloatOrNull() != null) {
+                    commitFlickFromDraft()
+                }
+            }
+        )
+        fixSetupBtn.setOnClickListener {
+            commitFlickFromDraft()
+            hideEditOverlayPopup()
+            onFixSetupRequested()
+        }
+        backdrop.setOnClickListener {
+            commitFlickFromDraft()
+            hideEditOverlayPopup()
+        }
+
         val anchor = toolbarParams
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = (anchor?.x ?: dpToPx(50)) + 20
             y = (anchor?.y ?: dpToPx(50)) + 130
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
         runCatching { windowManager.addView(popup, params) }
         settingsPopupView = popup
@@ -2109,11 +2219,8 @@ class OverlayController(
                     )
                 })
                 body.addView(buildVSpacer(10))
-                body.addView(buildBodyText(
-                    "How many times to swipe T1 and tap food when eating. Same 2s wait between each cycle."
-                ))
                 body.addView(buildLabeledNumberField(
-                    label = "How many times to eat",
+                    label = "How many times to eat food?",
                     hint = "3",
                     initialValue = draftEatCountText,
                     allowDecimal = false

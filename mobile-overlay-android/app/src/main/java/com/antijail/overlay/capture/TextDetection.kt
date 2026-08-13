@@ -4,6 +4,8 @@ package com.antijail.overlay.capture
 
 import android.graphics.Bitmap
 
+import com.antijail.overlay.model.Point
+
 import com.google.mlkit.vision.common.InputImage
 
 import com.google.mlkit.vision.text.TextRecognition
@@ -134,6 +136,51 @@ object TextDetection {
 
                 scanMiningMessages(bitmap).rawText.contains(phrase, ignoreCase = true)
 
+        }
+
+    private fun matchesPhrase(text: String, phrase: String): Boolean {
+        val hay = normalizeGameText(text)
+        val needle = normalizeGameText(phrase)
+        if (needle.isEmpty()) return false
+        if (hay.contains(needle)) return true
+        // Loose match for "Graal Online Era" when OCR splits/drops words.
+        val parts = needle.split(' ').filter { it.length >= 3 }
+        return parts.isNotEmpty() && parts.all { hay.contains(it) }
+    }
+
+    /**
+     * Returns the center of the first OCR line/block matching [phrase], in [bitmap] coordinates.
+     */
+    suspend fun findPhraseCenter(bitmap: Bitmap, phrase: String): Point? =
+        suspendCancellableCoroutine { cont ->
+            val image = InputImage.fromBitmap(bitmap, 0)
+            recognizer.process(image)
+                .addOnSuccessListener { result ->
+                    if (!cont.isActive) return@addOnSuccessListener
+                    for (block in result.textBlocks) {
+                        for (line in block.lines) {
+                            if (!matchesPhrase(line.text, phrase)) continue
+                            val box = line.boundingBox ?: continue
+                            cont.resume(
+                                Point(box.exactCenterX(), box.exactCenterY())
+                            )
+                            return@addOnSuccessListener
+                        }
+                        if (matchesPhrase(block.text, phrase)) {
+                            val box = block.boundingBox
+                            if (box != null) {
+                                cont.resume(
+                                    Point(box.exactCenterX(), box.exactCenterY())
+                                )
+                                return@addOnSuccessListener
+                            }
+                        }
+                    }
+                    cont.resume(null)
+                }
+                .addOnFailureListener {
+                    if (cont.isActive) cont.resume(null)
+                }
         }
 
 }
