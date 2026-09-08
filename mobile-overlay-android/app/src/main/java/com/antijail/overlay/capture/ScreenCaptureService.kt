@@ -81,6 +81,10 @@ class ScreenCaptureService : Service() {
         private val OK_TEMPLATE = R.drawable.ok_image
         private val THRIFT_SHOP_TEMPLATE = R.drawable.thriftshop
         private val DRILLIMG_TEMPLATE = R.drawable.drillimg
+        /** Reuse shared frame if newer than this (hot rock/HP/drill path). */
+        private const val SHARED_FRAME_HOT_MAX_AGE_MS = 40L
+        /** Slightly looser reuse for slower watchers (fire / OCR). */
+        private const val SHARED_FRAME_WATCH_MAX_AGE_MS = 100L
     }
     private val binder = LocalBinder()
     private var mediaProjection: MediaProjection? = null
@@ -99,6 +103,13 @@ class ScreenCaptureService : Service() {
 
     @Volatile
     private var lastFrameMismatchNudgeMs: Long = 0L
+
+    /** One shared full-frame bitmap for parallel watchers — avoids ImageReader contention. */
+    private val sharedFrameLock = Any()
+    private var sharedFrameBitmap: Bitmap? = null
+    private var sharedFrameW: Int = 0
+    private var sharedFrameH: Int = 0
+    private var sharedFrameMs: Long = 0L
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
@@ -235,6 +246,7 @@ class ScreenCaptureService : Service() {
      */
     private fun startCapture(): Boolean {
         val projection = mediaProjection ?: return false
+        clearSharedFrame()
         val existingDisplay = virtualDisplay
         if (existingDisplay != null) {
             releaseImageReaderOnly()
@@ -271,6 +283,73 @@ class ScreenCaptureService : Service() {
 
     fun isCaptureReady(): Boolean = mediaProjection != null && imageReader != null && virtualDisplay != null
 
+    private fun clearSharedFrame() {
+        synchronized(sharedFrameLock) {
+            sharedFrameBitmap?.recycle()
+            sharedFrameBitmap = null
+            sharedFrameW = 0
+            sharedFrameH = 0
+            sharedFrameMs = 0L
+        }
+    }
+
+    /**
+     * Refresh the shared full-frame bitmap from ImageReader when older than [maxAgeMs]
+     * (or always when [force]). Parallel detectors reuse this instead of each acquiring.
+     */
+    fun refreshLatestFrame(
+        maxAgeMs: Long = SHARED_FRAME_HOT_MAX_AGE_MS,
+        force: Boolean = false
+    ): Boolean {
+        synchronized(sharedFrameLock) {
+            val now = SystemClock.elapsedRealtime()
+            if (!force && sharedFrameBitmap != null && now - sharedFrameMs <= maxAgeMs) {
+                return true
+            }
+            val image = acquireLatestImageWithRetry(attempts = 8, sleepMs = 20L)
+                ?: return sharedFrameBitmap != null
+            return try {
+                val frameW = image.width
+                val frameH = image.height
+                if (frameW != screenWidth || frameH != screenHeight) {
+                    Log.w(
+                        TAG,
+                        "Frame ${frameW}x${frameH} != service ${screenWidth}x${screenHeight} — rotation mismatch; nudge capture restart"
+                    )
+                    if (now - lastFrameMismatchNudgeMs >= 600L) {
+                        lastFrameMismatchNudgeMs = now
+                        mainHandler.post { maybeRestartCaptureForDisplayChange() }
+                    }
+                }
+                val plane = image.planes.firstOrNull() ?: return sharedFrameBitmap != null
+                val buffer = plane.buffer.duplicate().apply { rewind() }
+                val bitmapWidth = (plane.rowStride / plane.pixelStride).coerceAtLeast(frameW)
+                val existing = sharedFrameBitmap
+                val bitmap = if (
+                    existing != null &&
+                    !existing.isRecycled &&
+                    existing.width == bitmapWidth &&
+                    existing.height == frameH
+                ) {
+                    existing
+                } else {
+                    existing?.recycle()
+                    Bitmap.createBitmap(bitmapWidth, frameH, Bitmap.Config.ARGB_8888).also {
+                        sharedFrameBitmap = it
+                    }
+                }
+                buffer.rewind()
+                bitmap.copyPixelsFromBuffer(buffer)
+                sharedFrameW = frameW
+                sharedFrameH = frameH
+                sharedFrameMs = SystemClock.elapsedRealtime()
+                true
+            } finally {
+                image.close()
+            }
+        }
+    }
+
     private fun acquireLatestImageWithRetry(attempts: Int = 12, sleepMs: Long = 50L): Image? {
         repeat(attempts) { idx ->
             val img = imageReader?.acquireLatestImage()
@@ -297,17 +376,75 @@ class ScreenCaptureService : Service() {
         return withBitmapForRegion(mapped, image, block)
     }
 
+    /**
+     * Shared-frame crop for OCR/templates. Copies under the lock so heavy work runs unlocked.
+     * [block] gets the crop plus its frame origin for tap coordinates.
+     */
+    private inline fun <T> withSharedCrop(
+        region: DetectionRegion,
+        maxAgeMs: Long = SHARED_FRAME_HOT_MAX_AGE_MS,
+        forceFresh: Boolean = false,
+        block: (crop: Bitmap, originX: Int, originY: Int) -> T
+    ): T? {
+        if (!refreshLatestFrame(maxAgeMs = maxAgeMs, force = forceFresh)) return null
+        var crop: Bitmap? = null
+        var originX = 0
+        var originY = 0
+        synchronized(sharedFrameLock) {
+            val frame = sharedFrameBitmap ?: return null
+            val fw = sharedFrameW
+            val fh = sharedFrameH
+            refreshDisplayMetrics()
+            val mapped = mapRegionToFrame(region, fw, fh)
+            val clip = regionPixelsClampedToFrame(mapped, fw, fh)
+            val rw = clip.right - clip.left
+            val rh = clip.bottom - clip.top
+            if (rw < 1 || rh < 1) return null
+            crop = Bitmap.createBitmap(frame, clip.left, clip.top, rw, rh)
+            originX = clip.left
+            originY = clip.top
+        }
+        val bitmap = crop ?: return null
+        return try {
+            block(bitmap, originX, originY)
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    /** Fast colour scans: refresh shared frame, then read pixels under the lock (no extra crop). */
+    private inline fun <T> withSharedFrameScan(
+        region: DetectionRegion,
+        maxAgeMs: Long = SHARED_FRAME_HOT_MAX_AGE_MS,
+        forceFresh: Boolean = false,
+        block: (bitmap: Bitmap, left: Int, top: Int, right: Int, bottom: Int, frameW: Int, frameH: Int) -> T
+    ): T? {
+        if (!refreshLatestFrame(maxAgeMs = maxAgeMs, force = forceFresh)) return null
+        synchronized(sharedFrameLock) {
+            val frame = sharedFrameBitmap ?: return null
+            val fw = sharedFrameW
+            val fh = sharedFrameH
+            refreshDisplayMetrics()
+            val mapped = mapRegionToFrame(region, fw, fh)
+            val clip = regionPixelsClampedToFrame(mapped, fw, fh)
+            return block(frame, clip.left, clip.top, clip.right, clip.bottom, fw, fh)
+        }
+    }
+
     private inline fun <T> withLatestMappedRegion(
         region: DetectionRegion,
         attempts: Int = 20,
         sleepMs: Long = 75L,
+        forceFresh: Boolean = false,
+        maxAgeMs: Long = SHARED_FRAME_WATCH_MAX_AGE_MS,
         block: (bitmap: Bitmap, left: Int, top: Int, right: Int, bottom: Int) -> T
     ): T? {
-        val image = acquireLatestImageWithRetry(attempts, sleepMs) ?: return null
-        return try {
-            withMappedRegionFromImage(region, image, block)
-        } finally {
-            image.close()
+        @Suppress("UNUSED_PARAMETER")
+        val unusedAttempts = attempts
+        @Suppress("UNUSED_PARAMETER")
+        val unusedSleep = sleepMs
+        return withSharedCrop(region, maxAgeMs = maxAgeMs, forceFresh = forceFresh) { crop, _, _ ->
+            block(crop, 0, 0, crop.width, crop.height)
         }
     }
 
@@ -415,22 +552,48 @@ class ScreenCaptureService : Service() {
      */
     fun scanDrillCyanRegion(region: DetectionRegion): DrillScanResult {
         refreshDisplayMetrics()
-        val image = acquireLatestImageWithRetry(attempts = 20, sleepMs = 75L)
-            ?: return DrillScanResult(
-                matchingPixels = 0,
-                centerColorHex = "#000000",
-                regionBounds = formatRegion(region),
-                frameSize = "no_frame",
-                detected = false
+        return withSharedFrameScan(region, maxAgeMs = SHARED_FRAME_HOT_MAX_AGE_MS) { bitmap, left, top, right, bottom, frameW, frameH ->
+            var matched = 0
+            val cx = ((left + right) / 2).coerceIn(left, max(left, right - 1))
+            val cy = ((top + bottom) / 2).coerceIn(top, max(top, bottom - 1))
+            val centerPixel = bitmap.getPixel(cx.coerceIn(0, bitmap.width - 1), cy.coerceIn(0, bitmap.height - 1))
+            val centerColorHex = String.format("#%06x", centerPixel and 0xFFFFFF)
+
+            for (y in top until bottom) {
+                if (y >= frameH || y >= bitmap.height) continue
+                for (x in left until right) {
+                    if (x >= frameW || x >= bitmap.width) continue
+                    val pixel = bitmap.getPixel(x, y)
+                    if (pixelMatchesDrillColor(Color.red(pixel), Color.green(pixel), Color.blue(pixel))) {
+                        matched++
+                        if (matched >= MIN_DRILL_PIXELS) break
+                    }
+                }
+                if (matched >= MIN_DRILL_PIXELS) break
+            }
+
+            val bounds = "[$left,$top,$right,$bottom]"
+            val detected = matched >= MIN_DRILL_PIXELS
+            Log.d(
+                TAG,
+                "scanDrillCyanRegion: matched=$matched min=$MIN_DRILL_PIXELS center=$centerColorHex " +
+                    "clip=$bounds raw=${formatRegion(region)} frame=${frameW}x${frameH} " +
+                    "colors=$DRILL_COLORS tol=$COLOR_TOLERANCE detected=$detected"
             )
-        return try {
-            val frameW = image.width
-            val frameH = image.height
-            val mapped = mapRegionToFrame(region, frameW, frameH)
-            scanDrillColorInImage(mapped, image, minMatches = MIN_DRILL_PIXELS)
-        } finally {
-            image.close()
-        }
+            DrillScanResult(
+                matchingPixels = matched,
+                centerColorHex = centerColorHex,
+                regionBounds = bounds,
+                frameSize = "${frameW}x${frameH}",
+                detected = detected
+            )
+        } ?: DrillScanResult(
+            matchingPixels = 0,
+            centerColorHex = "#000000",
+            regionBounds = formatRegion(region),
+            frameSize = "no_frame",
+            detected = false
+        )
     }
 
     /** Maps overlay/UI coordinates to the current capture frame when sizes differ. */
@@ -800,23 +963,29 @@ class ScreenCaptureService : Service() {
         fastCapture: Boolean
     ): DrillScanResult {
         refreshDisplayMetrics()
-        val (attempts, sleepMs) = if (fastCapture) 4 to 15L else 20 to 75L
-        val image = acquireLatestImageWithRetry(attempts = attempts, sleepMs = sleepMs)
-            ?: return DrillScanResult(
-                matchingPixels = 0,
-                centerColorHex = "#000000",
-                regionBounds = formatRegion(region),
-                frameSize = "no_frame",
-                detected = false
+        val maxAge = if (fastCapture) SHARED_FRAME_HOT_MAX_AGE_MS else SHARED_FRAME_WATCH_MAX_AGE_MS
+        return withSharedFrameScan(region, maxAgeMs = maxAge) { bitmap, left, top, right, bottom, frameW, frameH ->
+            scanColorInRegionFromBitmap(
+                region = region,
+                bitmap = bitmap,
+                left = left,
+                top = top,
+                right = right,
+                bottom = bottom,
+                frameW = frameW,
+                frameH = frameH,
+                minMatches = MIN_ROCK_PIXELS,
+                logLabel = "scanRockColorInImage",
+                extraLog = "colors=${VisionConfig.ROCK_MINED_COLORS} tol=${VisionConfig.ROCK_COLOR_TOLERANCE}",
+                colorMatcher = ::pixelMatchesRockColor
             )
-        return try {
-            val frameW = image.width
-            val frameH = image.height
-            val mapped = mapRegionToFrame(region, frameW, frameH)
-            scanRockColorInImage(mapped, image, minMatches = MIN_ROCK_PIXELS)
-        } finally {
-            image.close()
-        }
+        } ?: DrillScanResult(
+            matchingPixels = 0,
+            centerColorHex = "#000000",
+            regionBounds = formatRegion(region),
+            frameSize = "no_frame",
+            detected = false
+        )
     }
 
     private fun scanRockColorInImage(
@@ -832,6 +1001,73 @@ class ScreenCaptureService : Service() {
             extraLog = "colors=${VisionConfig.ROCK_MINED_COLORS} tol=${VisionConfig.ROCK_COLOR_TOLERANCE}",
             colorMatcher = ::pixelMatchesRockColor
         )
+
+    private fun scanColorInRegionFromBitmap(
+        region: DetectionRegion,
+        bitmap: Bitmap,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int,
+        frameW: Int,
+        frameH: Int,
+        minMatches: Int,
+        logLabel: String,
+        extraLog: String = "",
+        colorMatcher: (r: Int, g: Int, b: Int) -> Boolean
+    ): DrillScanResult {
+        if (frameW != screenWidth || frameH != screenHeight) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastFrameMismatchNudgeMs >= 600L) {
+                lastFrameMismatchNudgeMs = now
+                mainHandler.post { maybeRestartCaptureForDisplayChange() }
+            }
+        }
+        var matched = 0
+        val cx = ((left + right) / 2).coerceIn(left, max(left, right - 1))
+        val cy = ((top + bottom) / 2).coerceIn(top, max(top, bottom - 1))
+        var centerR = 0
+        var centerG = 0
+        var centerB = 0
+
+        for (y in top until bottom) {
+            if (y >= frameH || y >= bitmap.height) continue
+            for (x in left until right) {
+                if (x >= frameW || x >= bitmap.width) continue
+                val pixel = bitmap.getPixel(x, y)
+                val r = Color.red(pixel)
+                val g = Color.green(pixel)
+                val b = Color.blue(pixel)
+                if (x == cx && y == cy) {
+                    centerR = r
+                    centerG = g
+                    centerB = b
+                }
+                if (colorMatcher(r, g, b)) {
+                    matched++
+                    if (matched >= minMatches) break
+                }
+            }
+            if (matched >= minMatches) break
+        }
+
+        val centerColorHex = String.format("#%02x%02x%02x", centerR, centerG, centerB)
+        val bounds = "[$left,$top,$right,$bottom]"
+        val detected = matched >= minMatches
+        Log.d(
+            TAG,
+            "$logLabel: matched=$matched min=$minMatches center=$centerColorHex " +
+                "clip=$bounds raw=${formatRegion(region)} frame=${frameW}x${frameH} " +
+                "$extraLog detected=$detected"
+        )
+        return DrillScanResult(
+            matchingPixels = matched,
+            centerColorHex = centerColorHex,
+            regionBounds = bounds,
+            frameSize = "${frameW}x${frameH}",
+            detected = detected
+        )
+    }
 
     /**
      * Reads pixels straight from the capture [Image] plane (no bitmap stride padding).
@@ -1013,30 +1249,27 @@ class ScreenCaptureService : Service() {
      * Upscales the crop (same as mining OCR) so Graal UI text is readable.
      */
     suspend fun findTextTapPoint(region: DetectionRegion, phrase: String): com.antijail.overlay.model.Point? {
-        val result = withLatestMappedRegion(region) { bitmap, left, top, right, bottom ->
-            val rw = right - left
-            val rh = bottom - top
-            if (rw < 4 || rh < 4) return@withLatestMappedRegion null
-            val cropped = Bitmap.createBitmap(bitmap, left, top, rw, rh)
+        val result = withSharedCrop(
+            region,
+            maxAgeMs = SHARED_FRAME_WATCH_MAX_AGE_MS,
+            forceFresh = true
+        ) { crop, originX, originY ->
+            if (crop.width < 4 || crop.height < 4) return@withSharedCrop null
+            val scale = 3
+            val scaled = Bitmap.createScaledBitmap(
+                crop,
+                (crop.width * scale).coerceAtLeast(1),
+                (crop.height * scale).coerceAtLeast(1),
+                true
+            )
             try {
-                val scale = 3
-                val scaled = Bitmap.createScaledBitmap(
-                    cropped,
-                    (rw * scale).coerceAtLeast(1),
-                    (rh * scale).coerceAtLeast(1),
-                    true
+                val local = TextDetection.findPhraseCenter(scaled, phrase) ?: return@withSharedCrop null
+                com.antijail.overlay.model.Point(
+                    originX + local.x / scale,
+                    originY + local.y / scale
                 )
-                try {
-                    val local = TextDetection.findPhraseCenter(scaled, phrase) ?: return@withLatestMappedRegion null
-                    com.antijail.overlay.model.Point(
-                        left + local.x / scale,
-                        top + local.y / scale
-                    )
-                } finally {
-                    if (scaled !== cropped) scaled.recycle()
-                }
             } finally {
-                cropped.recycle()
+                if (scaled !== crop) scaled.recycle()
             }
         }
         Log.d(
@@ -1078,43 +1311,39 @@ class ScreenCaptureService : Service() {
         region: DetectionRegion,
         fastCapture: Boolean
     ): Boolean {
-        // Fast path: a few short grabs — too few attempts was missing real HP bars intermittently.
-        val (attempts, sleepMs) = if (fastCapture) 4 to 15L else 12 to 50L
-        val image = acquireLatestImageWithRetry(attempts = attempts, sleepMs = sleepMs) ?: return false
-        return try {
-            val targets = VisionConfig.HEALTH_SIGNAL_COLORS.map { hexToRgb(it) }
-            val tolerance = VisionConfig.HEALTH_SIGNAL_TOLERANCE
-            val minPixels = VisionConfig.HEALTH_SIGNAL_MIN_PIXELS
-            val minDistinct = if (fastCapture) {
-                VisionConfig.HEALTH_SIGNAL_MIN_COLORS_FAST
-            } else {
-                VisionConfig.HEALTH_SIGNAL_MIN_COLORS
-            }
-            withMappedRegionFromImage(region, image) { bitmap, left, top, right, bottom ->
-                val hits = IntArray(targets.size)
-                for (y in top until bottom) {
-                    for (x in left until right) {
-                        val pixel = bitmap.getPixel(x, y)
-                        val r = Color.red(pixel)
-                        val g = Color.green(pixel)
-                        val b = Color.blue(pixel)
-                        for (i in targets.indices) {
-                            if (hits[i] >= minPixels) continue
-                            val (rT, gT, bT) = targets[i]
-                            if (abs(r - rT) <= tolerance &&
-                                abs(g - gT) <= tolerance &&
-                                abs(b - bT) <= tolerance
-                            ) {
-                                hits[i]++
-                            }
+        val maxAge = if (fastCapture) SHARED_FRAME_HOT_MAX_AGE_MS else SHARED_FRAME_WATCH_MAX_AGE_MS
+        val targets = VisionConfig.HEALTH_SIGNAL_COLORS.map { hexToRgb(it) }
+        val tolerance = VisionConfig.HEALTH_SIGNAL_TOLERANCE
+        val minPixels = VisionConfig.HEALTH_SIGNAL_MIN_PIXELS
+        val minDistinct = if (fastCapture) {
+            VisionConfig.HEALTH_SIGNAL_MIN_COLORS_FAST
+        } else {
+            VisionConfig.HEALTH_SIGNAL_MIN_COLORS
+        }
+        return withSharedFrameScan(region, maxAgeMs = maxAge) { bitmap, left, top, right, bottom, _, _ ->
+            val hits = IntArray(targets.size)
+            for (y in top until bottom) {
+                if (y >= bitmap.height) continue
+                for (x in left until right) {
+                    if (x >= bitmap.width) continue
+                    val pixel = bitmap.getPixel(x, y)
+                    val r = Color.red(pixel)
+                    val g = Color.green(pixel)
+                    val b = Color.blue(pixel)
+                    for (i in targets.indices) {
+                        if (hits[i] >= minPixels) continue
+                        val (rT, gT, bT) = targets[i]
+                        if (abs(r - rT) <= tolerance &&
+                            abs(g - gT) <= tolerance &&
+                            abs(b - bT) <= tolerance
+                        ) {
+                            hits[i]++
                         }
                     }
                 }
-                hits.count { it >= minPixels } >= minDistinct
-            } ?: false
-        } finally {
-            image.close()
-        }
+            }
+            hits.count { it >= minPixels } >= minDistinct
+        } ?: false
     }
 
     /**
@@ -1176,27 +1405,21 @@ class ScreenCaptureService : Service() {
         scales: FloatArray = VisionConfig.SHOP_UI_TEMPLATE_SCALES,
         logTag: String = "findTemplateTapPoint"
     ): com.antijail.overlay.model.Point? =
-        withLatestMappedRegion(region) { bitmap, left, top, right, bottom ->
-            val rw = right - left
-            val rh = bottom - top
-            if (rw < 4 || rh < 4) return@withLatestMappedRegion null
-            val cropped = Bitmap.createBitmap(bitmap, left, top, rw, rh)
-            try {
-                val template = loadTemplate(templateResId) ?: return@withLatestMappedRegion null
-                val match = bestTemplateMatch(cropped, template, scales)
-                if (match.score < minScore) {
-                    Log.d(TAG, "$logTag: no match score=${match.score}")
-                    return@withLatestMappedRegion null
-                }
-                val tap = com.antijail.overlay.model.Point(
-                    left + match.centerX,
-                    top + match.centerY
-                )
-                Log.d(TAG, "$logTag: score=${match.score} tap=(${tap.x},${tap.y}) region=${formatRegion(region)}")
-                tap
-            } finally {
-                cropped.recycle()
+        // Force a fresh frame after gestures so Buy/Yes/OK aren't stale.
+        withSharedCrop(region, maxAgeMs = SHARED_FRAME_HOT_MAX_AGE_MS, forceFresh = true) { crop, originX, originY ->
+            if (crop.width < 4 || crop.height < 4) return@withSharedCrop null
+            val template = loadTemplate(templateResId) ?: return@withSharedCrop null
+            val match = bestTemplateMatch(crop, template, scales)
+            if (match.score < minScore) {
+                Log.d(TAG, "$logTag: no match score=${match.score}")
+                return@withSharedCrop null
             }
+            val tap = com.antijail.overlay.model.Point(
+                originX + match.centerX,
+                originY + match.centerY
+            )
+            Log.d(TAG, "$logTag: score=${match.score} tap=(${tap.x},${tap.y}) region=${formatRegion(region)}")
+            tap
         }
 
     fun findBatteryImageTapPoint(region: DetectionRegion): com.antijail.overlay.model.Point? =
@@ -1341,41 +1564,25 @@ class ScreenCaptureService : Service() {
         minClusterPixels: Int,
         fastCapture: Boolean = false
     ): SpiderClusterResult {
-        val (attempts, sleepMs) = if (fastCapture) 2 to 20L else 20 to 75L
         val colorTol = if (fastCapture) {
             VisionConfig.SPIDER_COLOR_TOLERANCE_FAST
         } else {
             VisionConfig.SPIDER_COLOR_TOLERANCE
         }
-        val image = acquireLatestImageWithRetry(attempts = attempts, sleepMs = sleepMs) ?: return SpiderClusterResult(
-            detected = false,
-            distinctColors = 0
-        )
-        return try {
-            refreshDisplayMetrics()
-            val frameW = image.width
-            val frameH = image.height
-            val mapped = mapRegionToFrame(region, frameW, frameH)
-            val clip = regionPixelsClampedToFrame(mapped, frameW, frameH)
-            val plane = image.planes.firstOrNull()
-                ?: return SpiderClusterResult(false, 0)
-
-            val buffer = plane.buffer.duplicate().apply { rewind() }
-            val pixelStride = plane.pixelStride
-            val rowStride = plane.rowStride
-            val limit = buffer.limit()
-
+        val maxAge = if (fastCapture) SHARED_FRAME_HOT_MAX_AGE_MS else SHARED_FRAME_WATCH_MAX_AGE_MS
+        return withSharedFrameScan(region, maxAgeMs = maxAge) { bitmap, left, top, right, bottom, frameW, frameH ->
             val matches = ArrayList<SpiderMatch>(64)
-            for (y in clip.top until clip.bottom) {
-                if (y >= frameH) continue
-                for (x in clip.left until clip.right) {
-                    if (x >= frameW) continue
-                    val offset = y * rowStride + x * pixelStride
-                    if (offset + 2 >= limit) continue
-                    val r = buffer.get(offset).toInt() and 0xFF
-                    val g = buffer.get(offset + 1).toInt() and 0xFF
-                    val b = buffer.get(offset + 2).toInt() and 0xFF
-                    val colorIndex = pixelMatchesSpiderColor(r, g, b, colorTol)
+            for (y in top until bottom) {
+                if (y >= frameH || y >= bitmap.height) continue
+                for (x in left until right) {
+                    if (x >= frameW || x >= bitmap.width) continue
+                    val pixel = bitmap.getPixel(x, y)
+                    val colorIndex = pixelMatchesSpiderColor(
+                        Color.red(pixel),
+                        Color.green(pixel),
+                        Color.blue(pixel),
+                        colorTol
+                    )
                     if (colorIndex >= 0) {
                         matches.add(SpiderMatch(x, y, colorIndex))
                     }
@@ -1383,7 +1590,7 @@ class ScreenCaptureService : Service() {
             }
 
             if (matches.size < minClusterPixels) {
-                return SpiderClusterResult(false, 0)
+                return@withSharedFrameScan SpiderClusterResult(false, 0)
             }
 
             val window = if (fastCapture) {
@@ -1399,12 +1606,12 @@ class ScreenCaptureService : Service() {
             var bestDistinct = 0
             var bestMatches: List<SpiderMatch> = emptyList()
 
-            var wy = clip.top
-            while (wy < clip.bottom) {
-                val wyEnd = min(wy + window, clip.bottom)
-                var wx = clip.left
-                while (wx < clip.right) {
-                    val wxEnd = min(wx + window, clip.right)
+            var wy = top
+            while (wy < bottom) {
+                val wyEnd = min(wy + window, bottom)
+                var wx = left
+                while (wx < right) {
+                    val wxEnd = min(wx + window, right)
                     val inWindow = matches.filter { it.x in wx until wxEnd && it.y in wy until wyEnd }
                     val distinct = inWindow.map { it.colorIndex }.toSet().size
                     if (distinct > bestDistinct ||
@@ -1424,15 +1631,20 @@ class ScreenCaptureService : Service() {
                     "scanSpiderCluster: no cluster distinct=$bestDistinct pixels=${bestMatches.size} " +
                         "region=${formatRegion(region)}"
                 )
-                return SpiderClusterResult(false, bestDistinct)
+                return@withSharedFrameScan SpiderClusterResult(false, bestDistinct)
             }
 
             val centroidX = bestMatches.map { it.x }.average().toFloat()
             val centroidY = bestMatches.map { it.y }.average().toFloat()
-            val centerX = (clip.left + clip.right) / 2f
-            val centerY = (clip.top + clip.bottom) / 2f
+            val centerX = (left + right) / 2f
+            val centerY = (top + bottom) / 2f
             val votes = linkedMapOf("UP" to 0, "RIGHT" to 0, "DOWN" to 0, "LEFT" to 0)
-            val distinctByDir = linkedMapOf("UP" to HashSet<Int>(), "RIGHT" to HashSet(), "DOWN" to HashSet(), "LEFT" to HashSet())
+            val distinctByDir = linkedMapOf(
+                "UP" to HashSet<Int>(),
+                "RIGHT" to HashSet(),
+                "DOWN" to HashSet(),
+                "LEFT" to HashSet()
+            )
             for (m in bestMatches) {
                 val dir = spiderTriangleDirection(m.x - centerX, m.y - centerY)
                 votes[dir] = (votes[dir] ?: 0) + 1
@@ -1465,42 +1677,26 @@ class ScreenCaptureService : Service() {
                 distinctColors = bestDistinct,
                 direction = direction
             )
-        } finally {
-            image.close()
-        }
+        } ?: SpiderClusterResult(detected = false, distinctColors = 0)
     }
 
     /**
      * True when a local cluster of the battery-dead landmark colour (#9c7952) is visible in [region].
      */
     fun regionHasBatteryLandmarkCluster(region: DetectionRegion): Boolean {
-        val image = acquireLatestImageWithRetry(attempts = 15, sleepMs = 50L) ?: return false
-        return try {
-            refreshDisplayMetrics()
-            val frameW = image.width
-            val frameH = image.height
-            val mapped = mapRegionToFrame(region, frameW, frameH)
-            val clip = regionPixelsClampedToFrame(mapped, frameW, frameH)
-            val plane = image.planes.firstOrNull() ?: return false
-
-            val (rT, gT, bT) = hexToRgb(VisionConfig.BATTERY_LANDMARK_COLOR)
-            val tolerance = VisionConfig.BATTERY_LANDMARK_TOLERANCE
-
-            val buffer = plane.buffer.duplicate().apply { rewind() }
-            val pixelStride = plane.pixelStride
-            val rowStride = plane.rowStride
-            val limit = buffer.limit()
-
+        val (rT, gT, bT) = hexToRgb(VisionConfig.BATTERY_LANDMARK_COLOR)
+        val tolerance = VisionConfig.BATTERY_LANDMARK_TOLERANCE
+        return withSharedFrameScan(region, maxAgeMs = SHARED_FRAME_WATCH_MAX_AGE_MS, forceFresh = true) {
+                bitmap, left, top, right, bottom, frameW, frameH ->
             val matches = ArrayList<Pair<Int, Int>>(64)
-            for (y in clip.top until clip.bottom) {
-                if (y >= frameH) continue
-                for (x in clip.left until clip.right) {
-                    if (x >= frameW) continue
-                    val offset = y * rowStride + x * pixelStride
-                    if (offset + 2 >= limit) continue
-                    val r = buffer.get(offset).toInt() and 0xFF
-                    val g = buffer.get(offset + 1).toInt() and 0xFF
-                    val b = buffer.get(offset + 2).toInt() and 0xFF
+            for (y in top until bottom) {
+                if (y >= frameH || y >= bitmap.height) continue
+                for (x in left until right) {
+                    if (x >= frameW || x >= bitmap.width) continue
+                    val pixel = bitmap.getPixel(x, y)
+                    val r = Color.red(pixel)
+                    val g = Color.green(pixel)
+                    val b = Color.blue(pixel)
                     if (abs(r - rT) <= tolerance && abs(g - gT) <= tolerance && abs(b - bT) <= tolerance) {
                         matches.add(x to y)
                     }
@@ -1508,7 +1704,7 @@ class ScreenCaptureService : Service() {
             }
 
             if (matches.size < VisionConfig.BATTERY_LANDMARK_MIN_CLUSTER_PIXELS) {
-                return false
+                return@withSharedFrameScan false
             }
 
             val window = VisionConfig.BATTERY_LANDMARK_CLUSTER_WINDOW_PX
@@ -1516,12 +1712,12 @@ class ScreenCaptureService : Service() {
             val minPixels = VisionConfig.BATTERY_LANDMARK_MIN_CLUSTER_PIXELS
             var bestCount = 0
 
-            var wy = clip.top
-            while (wy < clip.bottom) {
-                val wyEnd = min(wy + window, clip.bottom)
-                var wx = clip.left
-                while (wx < clip.right) {
-                    val wxEnd = min(wx + window, clip.right)
+            var wy = top
+            while (wy < bottom) {
+                val wyEnd = min(wy + window, bottom)
+                var wx = left
+                while (wx < right) {
+                    val wxEnd = min(wx + window, right)
                     var count = 0
                     for ((mx, my) in matches) {
                         if (mx in wx until wxEnd && my in wy until wyEnd) {
@@ -1531,7 +1727,7 @@ class ScreenCaptureService : Service() {
                                     TAG,
                                     "batteryLandmark: cluster found pixels=$count region=${formatRegion(region)}"
                                 )
-                                return true
+                                return@withSharedFrameScan true
                             }
                         }
                     }
@@ -1546,9 +1742,7 @@ class ScreenCaptureService : Service() {
                 "batteryLandmark: not found bestCluster=$bestCount region=${formatRegion(region)}"
             )
             false
-        } finally {
-            image.close()
-        }
+        } ?: false
     }
 
     /** @deprecated Colour-only spider scan — use [scanSpiderCluster]. */
@@ -1732,6 +1926,7 @@ class ScreenCaptureService : Service() {
     }
 
     private fun releaseCapture() {
+        clearSharedFrame()
         virtualDisplay?.release()
         releaseImageReaderOnly()
         virtualDisplay = null
