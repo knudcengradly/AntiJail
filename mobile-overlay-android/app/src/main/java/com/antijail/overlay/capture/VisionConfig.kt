@@ -175,7 +175,7 @@ object VisionConfig {
 
     /** Battery shop item — scanned during battery-dead recovery. */
 
-    const val BATTERY_MIN_MATCH_SCORE = MOVEMENT_MIN_MATCH_SCORE
+    const val BATTERY_MIN_MATCH_SCORE = 0.50
 
     val BATTERY_TEMPLATE_SCALES = floatArrayOf(0.85f, 0.9f, 0.95f, 1.0f, 1.05f, 1.1f, 1.15f)
 

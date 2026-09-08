@@ -88,8 +88,11 @@ class MiningEngine {
         private const val GESTURE_STEP_DELAY_MS = 700L
         private const val MINE_COLLAPSE_PRE_SWIPE_MS = 2_000L
         private const val BATTERY_DEAD_INITIAL_MS = 2_000L
-        private const val BATTERY_PRE_SHOP_DRAG_MS = 1_000L
-        private const val BATTERY_PRE_SHOP_CLICK_DELAY_MS = 100L
+        /** After Right→Left 5s: approach shop, then battery/Buy/Yes/OK. */
+        private const val BATTERY_PRE_SHOP_STEP_GAP_MS = 150L
+        private const val BATTERY_PRE_SHOP_DOWN_UP_LONG_MS = 18_000L
+        private const val BATTERY_PRE_SHOP_LEFT_RIGHT_MS = 5_000L
+        private const val BATTERY_PRE_SHOP_DOWN_UP_SHORT_MS = 6_000L
         private const val BATTERY_IMAGE_POLL_MS = 500L
         private const val BATTERY_IMAGE_TIMEOUT_MS = 15_000L
         private const val BATTERY_STEP4_LONG_DRAG_MS = 18_000L
@@ -1461,14 +1464,15 @@ class MiningEngine {
         if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return
         dpadDirectionMove(service, layout, "UP", "LEFT", 3_000L)
         if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return
-        dpadDirectionMove(service, layout, "RIGHT", "LEFT", 5_000L)
+        dpadDirectionMove(service, layout, "RIGHT", "LEFT", 4_700L)
         if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return
-        dpadDirectionMove(service, layout, "DOWN", "UP", 2_000L)
-        if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return
-        if (!runBatteryDeadLandmarkPhase(service, layout)) return
-
-        dpadDirectionMove(service, layout, "UP", "RIGHT", BATTERY_PRE_SHOP_DRAG_MS)
-        if (!delayUnlessStopped(BATTERY_PRE_SHOP_CLICK_DELAY_MS)) return
+        // Approach shop: D→U 18s → L→R 5s → D→U 6s, then battery/Buy/Yes/OK
+        dpadDirectionMove(service, layout, "DOWN", "UP", BATTERY_PRE_SHOP_DOWN_UP_LONG_MS)
+        if (!delayUnlessStopped(BATTERY_PRE_SHOP_STEP_GAP_MS)) return
+        dpadDirectionMove(service, layout, "LEFT", "RIGHT", BATTERY_PRE_SHOP_LEFT_RIGHT_MS)
+        if (!delayUnlessStopped(BATTERY_PRE_SHOP_STEP_GAP_MS)) return
+        dpadDirectionMove(service, layout, "DOWN", "UP", BATTERY_PRE_SHOP_DOWN_UP_SHORT_MS)
+        if (!delayUnlessStopped(BATTERY_PRE_SHOP_STEP_GAP_MS)) return
         if (!detectAndTapShopImage(service, BatteryShopImage.BATTERY)) return
         if (!detectAndTapShopImage(service, BatteryShopImage.BUY)) return
         if (!detectAndTapShopImage(service, BatteryShopImage.YES)) return
