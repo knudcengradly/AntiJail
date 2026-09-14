@@ -172,7 +172,7 @@ class MiningEngine {
         private const val GESTURE_CANCEL_SETTLE_MS = 400L
         private const val ANTIJAIL_POST_DRAG_MS = 200L
         /** Standalone drill watch cadence — poll the drill box this often, independent of attacks. */
-        private const val DRILL_POLL_INTERVAL_MS = 800L
+        private const val DRILL_POLL_INTERVAL_MS = 300L
         /** Quick re-check interval while confirming a suspected no-drill. */
         private const val DRILL_PRE_TAP_POLL_MS = 50L
         /** No-drill must persist this long (quick re-confirm) before recovery fires. */
