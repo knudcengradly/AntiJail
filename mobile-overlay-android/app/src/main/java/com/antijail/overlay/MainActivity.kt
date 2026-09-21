@@ -219,6 +219,7 @@ class MainActivity : ComponentActivity() {
                         markerOpacity = 1f
                     )
                     miningSettings = profileStore.miningSettingsFlow.first()
+                    miningEngine.applySettings(miningSettings)
                     fishSettings = profileStore.fishSettingsFlow.first()
                     setupLayout = profileStore.setupLayoutFlow.first()
                     setupProgress = profileStore.setupProgressFlow.first()
@@ -417,7 +418,13 @@ class MainActivity : ComponentActivity() {
                 onFixSetupRequested = { handleFixSetupRequested() },
                 onPlayPressed = {
                     overlayController?.showModeSelectionOverlay(
-                        onMine = { overlayController?.showMiningSettingsOverlay(miningSettings) },
+                        onMine = {
+                            lifecycleScope.launch {
+                                miningSettings = profileStore.miningSettingsFlow.first()
+                                miningEngine.applySettings(miningSettings)
+                                overlayController?.showMiningSettingsOverlay(miningSettings)
+                            }
+                        },
                         onDig = { overlayController?.showDigPlaceholderOverlay() },
                         onFish = { overlayController?.showFishSettingsOverlay(fishSettings) },
                         onSetup = { overlayController?.showSetupMenuOverlay() }
@@ -425,12 +432,18 @@ class MainActivity : ComponentActivity() {
                 },
                 onMineStart = { settings, referenceRegion ->
                     miningSettings = settings
+                    miningEngine.applySettings(settings)
                     // New run: drop any previous session image before capturing a fresh one.
                     discardReferenceSpotImage()
                     referenceSpotRegion = referenceRegion
                     // Position-only is persisted by OverlayController; never persist the image.
                     lifecycleScope.launch { profileStore.saveMiningSettings(settings) }
                     startMining(settings)
+                },
+                onMiningSettingsChanged = { settings ->
+                    miningSettings = settings
+                    miningEngine.applySettings(settings)
+                    lifecycleScope.launch { profileStore.saveMiningSettings(settings) }
                 },
                 onFishStart = { settings ->
                     fishSettings = settings
@@ -948,9 +961,11 @@ class MainActivity : ComponentActivity() {
             return
         }
         lifecycleScope.launch(Dispatchers.Default) {
-            overlayController?.showMacroToast("Returning to mine… walking to location")
+            miningSettings = profileStore.miningSettingsFlow.first()
+            overlayController?.showMacroToast("Returning to mine… walking to location ${miningSettings.miningLocation}")
             miningEngine.runManualMineCollapseEscape(
-                layoutProvider = { scaledSetupLayout() }
+                layoutProvider = { scaledSetupLayout() },
+                settings = miningSettings
             )
             if (miningEngine.isRunning()) {
                 runOnUiThread { overlayController?.showMacroToast("Resuming mining…") }

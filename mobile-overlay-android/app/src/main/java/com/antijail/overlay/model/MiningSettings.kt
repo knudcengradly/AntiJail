@@ -27,7 +27,8 @@ data class MiningSettings(
     val eatFoodCount: Int = 3,
     /**
      * Spot to walk to after returning to the mine (fire, battery dead, or Home).
-     * Values 1–6; all locations walk after return (4–6 include Graal return).
+     * Values 1–16. Loc 1–6 use return-to-mine 1 (4–6 also Graal). Loc 7+ use return-to-mine 2
+     * (10 and 14 also Graal).
      */
     val miningLocation: Int = 1,
     val moveWhenStationary: Boolean = true,

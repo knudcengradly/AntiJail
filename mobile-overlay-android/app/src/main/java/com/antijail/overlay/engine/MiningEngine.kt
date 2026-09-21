@@ -200,6 +200,11 @@ class MiningEngine {
 
     fun isRunning() = loopJob?.isActive == true
 
+    /** Keep Home / fire / battery return on the last saved location, even if mining is not running. */
+    fun applySettings(settings: MiningSettings) {
+        activeSettings = settings
+    }
+
     /** Sync Up/Down Graal flick duration from settings (seconds, e.g. 0.15). */
     fun setGraalReturnFlickSeconds(seconds: Float) {
         graalReturnFlickMs = (seconds.coerceIn(0.05f, 5f) * 1000f).toLong()
@@ -513,8 +518,10 @@ class MiningEngine {
      * then walks to the configured mining location and resumes (same as fire / battery return).
      */
     suspend fun runManualMineCollapseEscape(
-        layoutProvider: () -> SetupLayout
+        layoutProvider: () -> SetupLayout,
+        settings: MiningSettings? = null
     ) {
+        if (settings != null) activeSettings = settings
         if (fireSequenceActive || foodSequenceRunning || batterySequenceActive) return
         stopRequested = false
         detectionCooldownUntilMs = 0L
@@ -1106,6 +1113,18 @@ class MiningEngine {
         if (!ensureRunning()) return false
         service.tap(dpadCenter(layout), holdMs = ATTACK_HOLD_MS)
         if (!delayUnlessStopped(MINE_COLLAPSE_POST_CENTER_TAP_MS)) return false
+        return if (activeSettings.miningLocation >= 7) {
+            runMineCollapseReturnToMine2(service, layout)
+        } else {
+            runMineCollapseReturnToMine1(service, layout)
+        }
+    }
+
+    /** Return-to-mine 1 — locations 1–6 (thrift-shop path). */
+    private suspend fun runMineCollapseReturnToMine1(
+        service: AutoClickAccessibilityService,
+        layout: SetupLayout
+    ): Boolean {
         dpadDirectionMove(service, layout, "UP", "RIGHT", 3_000L)
         if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return false
         dpadDirectionMove(service, layout, "UP", "LEFT", MINE_COLLAPSE_UP_LEFT_MS)
@@ -1135,6 +1154,32 @@ class MiningEngine {
         if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return false
         dpadDirectionMove(service, layout, "UP", "DOWN", 2_000L)
         if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return false
+        if (stopRequested) return false
+        return finishMineReturnWithLocation(service, layout)
+    }
+
+    /** Return-to-mine 2 — locations 7+. */
+    private suspend fun runMineCollapseReturnToMine2(
+        service: AutoClickAccessibilityService,
+        layout: SetupLayout
+    ): Boolean {
+        val steps = listOf(
+            Triple("UP", "RIGHT", 3_000L),
+            Triple("UP", "LEFT", 3_000L),
+            Triple("RIGHT", "LEFT", 4_700L),
+            Triple("DOWN", "UP", 17_000L),
+            Triple("DOWN", "RIGHT", 1_000L),
+            Triple("LEFT", "RIGHT", 4_500L),
+            Triple("DOWN", "UP", 4_000L),
+            Triple("RIGHT", "LEFT", 2_000L),
+            Triple("LEFT", "UP", 2_000L),
+            Triple("UP", "DOWN", 1_000L),
+            Triple("DOWN", "UP", 1_200L)
+        )
+        for ((from, to, ms) in steps) {
+            dpadDirectionMove(service, layout, from, to, ms)
+            if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return false
+        }
         if (stopRequested) return false
         return finishMineReturnWithLocation(service, layout)
     }
@@ -1208,18 +1253,9 @@ class MiningEngine {
         service: AutoClickAccessibilityService,
         layout: SetupLayout
     ): Boolean {
+        val loc = activeSettings.miningLocation.coerceIn(1, 16)
         if (stopRequested) return false
-        return when (activeSettings.miningLocation.coerceIn(1, 6)) {
-            1, 2, 3, 4, 5, 6 -> runMiningLocationSequence(
-                service,
-                layout,
-                activeSettings.miningLocation.coerceIn(1, 6)
-            )
-            else -> {
-                stopMacroAfterMineReturn()
-                false
-            }
-        }
+        return runMiningLocationSequence(service, layout, loc)
     }
 
     /** D-pad drag for location walks — same style as return-to-mine, 100ms between steps. */
@@ -1254,8 +1290,8 @@ class MiningEngine {
 
     /** Loc 4–6 only: start counting attacks until the first successful rock mine. */
     private fun armPostReturnNoRockWatch() {
-        val loc = activeSettings.miningLocation.coerceIn(1, 6)
-        if (loc in 4..6) {
+        val loc = activeSettings.miningLocation.coerceIn(1, 16)
+        if (loc in 4..6 || loc == 10 || loc == 14) {
             postReturnNoRockWatchActive = true
             postReturnAttacksWithoutRock = 0
         } else {
@@ -1311,6 +1347,73 @@ class MiningEngine {
                 if (!locationDpadMove(service, layout, "UP", "DOWN", 1_000L)) return false
                 if (!locationDpadMove(service, layout, "UP", "LEFT", 5_000L)) return false
                 return runGraalReturnToGame(service, layout, resumeMining = true)
+            }
+            7 -> {
+                if (!locationDpadMove(service, layout, "UP", "LEFT", 3_000L)) return false
+                if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 500L)) return false
+                if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 700L)) return false
+                if (!locationDpadMove(service, layout, "RIGHT", "DOWN", 1_500L)) return false
+            }
+            8, 9, 10 -> {
+                if (!locationDpadMove(service, layout, "UP", "LEFT", 3_000L)) return false
+                if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 700L)) return false
+                if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 4_500L)) return false
+                if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 250L)) return false
+                if (location == 10) {
+                    if (!locationDpadMove(service, layout, "UP", "DOWN", 700L)) return false
+                    if (!locationDpadMove(service, layout, "UP", "LEFT", 2_000L)) return false
+                    return runGraalReturnToGame(service, layout, resumeMining = true)
+                }
+                if (!locationDpadMove(service, layout, "UP", "DOWN", 7_000L)) return false
+                if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 2_500L)) return false
+                if (!locationDpadMove(service, layout, "UP", "DOWN", 3_000L)) return false
+                if (location == 9) {
+                    if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 2_500L)) return false
+                    if (!locationDpadMove(service, layout, "UP", "LEFT", 2_000L)) return false
+                }
+            }
+            11, 12, 13, 14, 15, 16 -> {
+                if (!locationDpadMove(service, layout, "UP", "LEFT", 3_000L)) return false
+                if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 500L)) return false
+                if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 1_000L)) return false
+                if (!locationDpadMove(service, layout, "RIGHT", "DOWN", 1_000L)) return false
+                if (!locationDpadMove(service, layout, "RIGHT", "UP", 4_000L)) return false
+                when (location) {
+                    11 -> {
+                        if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 300L)) return false
+                        if (!locationDpadMove(service, layout, "UP", "DOWN", 2_000L)) return false
+                    }
+                    12 -> {
+                        if (!locationDpadMove(service, layout, "UP", "LEFT", 300L)) return false
+                        if (!locationDpadMove(service, layout, "UP", "DOWN", 1_000L)) return false
+                        if (!locationDpadMove(service, layout, "UP", "LEFT", 700L)) return false
+                    }
+                    13 -> {
+                        if (!locationDpadMove(service, layout, "UP", "LEFT", 300L)) return false
+                        if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 3_000L)) return false
+                        if (!locationDpadMove(service, layout, "UP", "DOWN", 1_000L)) return false
+                    }
+                    14, 15, 16 -> {
+                        if (!locationDpadMove(service, layout, "UP", "DOWN", 800L)) return false
+                        if (!locationDpadMove(service, layout, "RIGHT", "UP", 5_000L)) return false
+                        when (location) {
+                            14 -> {
+                                if (!locationDpadMove(service, layout, "UP", "DOWN", 2_000L)) return false
+                                if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 800L)) return false
+                                if (!locationDpadMove(service, layout, "UP", "LEFT", 1_000L)) return false
+                                return runGraalReturnToGame(service, layout, resumeMining = true)
+                            }
+                            15 -> {
+                                if (!locationDpadMove(service, layout, "UP", "DOWN", 2_000L)) return false
+                                if (!locationDpadMove(service, layout, "RIGHT", "LEFT", 1_500L)) return false
+                            }
+                            16 -> {
+                                if (!locationDpadMove(service, layout, "LEFT", "RIGHT", 3_000L)) return false
+                                if (!locationDpadMove(service, layout, "UP", "LEFT", 1_000L)) return false
+                            }
+                        }
+                    }
+                }
             }
         }
         return resumeMiningAfterLocation(service, layout)
@@ -1466,12 +1569,13 @@ class MiningEngine {
         if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return
         dpadDirectionMove(service, layout, "RIGHT", "LEFT", 4_700L)
         if (!delayUnlessStopped(MINE_COLLAPSE_STEP_DELAY_MS)) return
-        // Approach shop: D→U 18s → L→R 5s → D→U 6s, then battery/Buy/Yes/OK
-        dpadDirectionMove(service, layout, "DOWN", "UP", BATTERY_PRE_SHOP_DOWN_UP_LONG_MS)
+        dpadDirectionMove(service, layout, "DOWN", "UP", 17_000L)
         if (!delayUnlessStopped(BATTERY_PRE_SHOP_STEP_GAP_MS)) return
-        dpadDirectionMove(service, layout, "LEFT", "RIGHT", BATTERY_PRE_SHOP_LEFT_RIGHT_MS)
+        dpadDirectionMove(service, layout, "DOWN", "RIGHT", 1_000L)
         if (!delayUnlessStopped(BATTERY_PRE_SHOP_STEP_GAP_MS)) return
-        dpadDirectionMove(service, layout, "DOWN", "UP", BATTERY_PRE_SHOP_DOWN_UP_SHORT_MS)
+        dpadDirectionMove(service, layout, "LEFT", "RIGHT", 4_500L)
+        if (!delayUnlessStopped(BATTERY_PRE_SHOP_STEP_GAP_MS)) return
+        dpadDirectionMove(service, layout, "DOWN", "UP", 4_000L)
         if (!delayUnlessStopped(BATTERY_PRE_SHOP_STEP_GAP_MS)) return
         if (!detectAndTapShopImage(service, BatteryShopImage.BATTERY)) return
         if (!detectAndTapShopImage(service, BatteryShopImage.BUY)) return

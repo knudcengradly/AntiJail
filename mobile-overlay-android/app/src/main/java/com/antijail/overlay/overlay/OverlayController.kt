@@ -78,6 +78,7 @@ class OverlayController(
     private val onFixSetupRequested: () -> Unit,
     private val onPlayPressed: () -> Unit,
     private val onMineStart: (MiningSettings, DetectionRegion?) -> Unit,
+    private val onMiningSettingsChanged: (MiningSettings) -> Unit = {},
     private val onFishStart: (FishSettings) -> Unit,
     private val onSetupLayoutSaved: (SetupLayout) -> Unit,
     private val setupLayoutProvider: () -> SetupLayout,
@@ -2159,7 +2160,7 @@ class OverlayController(
         var selectedDirection = initialSettings.direction
         var mineLevel = initialSettings.mineLevel
         var additionalDelay = initialSettings.additionalDelaySeconds
-        var miningLocation = initialSettings.miningLocation.coerceIn(1, 6)
+        var miningLocation = initialSettings.miningLocation.coerceIn(1, 16)
         var moveWhenStationary = initialSettings.moveWhenStationary
         var killSpiders = initialSettings.killSpiders
         var drillDetection = initialSettings.drillDetection
@@ -2243,14 +2244,14 @@ class OverlayController(
             onNegative = { hideMiningSettingsOverlay() },
             onPositive = {
                 hideMiningSettingsOverlay()
-                showReferenceSpotOverlay(MiningSettings(
+                val next = MiningSettings(
                     direction = selectedDirection,
                     mineLevel = mineLevel,
                     additionalDelaySeconds = additionalDelay,
                     baseClickIntervalSeconds = baseClickInterval.coerceAtLeast(0.5f),
                     rockMinedDelaySeconds = rockMinedDelay.coerceAtLeast(0f),
                     eatFoodCount = eatFoodCount.coerceAtLeast(1),
-                    miningLocation = miningLocation.coerceIn(1, 6),
+                    miningLocation = miningLocation.coerceIn(1, 16),
                     moveWhenStationary = moveWhenStationary,
                     killSpiders = killSpiders,
                     drillDetection = drillDetection,
@@ -2258,7 +2259,9 @@ class OverlayController(
                     autoMineCollapsed = autoMineCollapsed,
                     exitHospital = exitHospital,
                     noBattery = noBattery
-                ))
+                )
+                onMiningSettingsChanged(next)
+                showReferenceSpotOverlay(next)
             }
         )
 
@@ -2325,7 +2328,7 @@ class OverlayController(
                 "Mining location after returning to the mine (fire, battery dead, or Home). " +
                     "Walks to the chosen spot and resumes mining. Does not affect no-drill."
             ))
-            val locationSpinner = buildStyledSpinner((1..6).map { it.toString() }) { idx ->
+            val locationSpinner = buildStyledSpinner((1..16).map { it.toString() }) { idx ->
                 miningLocation = idx + 1
             }
             addOutlinedSpinner(body, locationSpinner)
