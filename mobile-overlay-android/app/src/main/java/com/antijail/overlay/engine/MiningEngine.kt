@@ -12,6 +12,7 @@ import com.antijail.overlay.model.SpiderClusterResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -195,7 +196,25 @@ class MiningEngine {
         /** Background fire watch cadence — independent of mining timings. */
         private const val FIRE_WATCH_POLL_MS = 1_000L
         /** Background battery/no-mine OCR watch cadence — independent of mining timings. */
-        private const val TEXT_WATCH_POLL_MS = 1_000L
+        private const val TEXT_WATCH_POLL_MS = 2_000L
+        /** Manual Home: wait this long for an in-flight fire/battery/food sequence before force-clear. */
+        private const val HOME_BUSY_WAIT_MS = 15_000L
+
+        /**
+         * After waiting [waitedMs] for busy flags, force-clear if still busy and wait exhausted.
+         * Pure helper so a self-check can lock the decision without the emulator.
+         */
+        fun shouldForceClearHomeGuards(
+            waitedMs: Long,
+            stillBusy: Boolean,
+            timeoutMs: Long = HOME_BUSY_WAIT_MS
+        ): Boolean = stillBusy && waitedMs >= timeoutMs
+
+        init {
+            check(!shouldForceClearHomeGuards(0L, true))
+            check(!shouldForceClearHomeGuards(HOME_BUSY_WAIT_MS, false))
+            check(shouldForceClearHomeGuards(HOME_BUSY_WAIT_MS, true))
+        }
     }
 
     fun isRunning() = loopJob?.isActive == true
@@ -279,7 +298,7 @@ class MiningEngine {
         this.onPlayDrillAlarm = onPlayDrillAlarm
         this.miningTextScanner = miningTextScanner
         this.referenceSpotDetector = referenceSpotDetector
-        val scope = CoroutineScope(Dispatchers.Default)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         engineScope = scope
         loopJob = scope.launch {
             try {
@@ -516,31 +535,55 @@ class MiningEngine {
     /**
      * Overlay home button — pauses mining/detections, runs mine-collapse escape,
      * then walks to the configured mining location and resumes (same as fire / battery return).
+     * @return true if escape was attempted (busy wait may force-clear stuck flags first).
      */
     suspend fun runManualMineCollapseEscape(
         layoutProvider: () -> SetupLayout,
         settings: MiningSettings? = null
-    ) {
+    ): Boolean {
         if (settings != null) activeSettings = settings
-        if (fireSequenceActive || foodSequenceRunning || batterySequenceActive) return
-        stopRequested = false
         detectionCooldownUntilMs = 0L
+
+        val waitStarted = SystemClock.elapsedRealtime()
+        while (
+            (fireSequenceActive || foodSequenceRunning || batterySequenceActive) &&
+            SystemClock.elapsedRealtime() - waitStarted < HOME_BUSY_WAIT_MS
+        ) {
+            delay(50)
+        }
+        val waitedMs = SystemClock.elapsedRealtime() - waitStarted
+        val stillBusy = fireSequenceActive || foodSequenceRunning || batterySequenceActive
+        if (shouldForceClearHomeGuards(waitedMs, stillBusy)) {
+            clearSequenceBusyFlags()
+        } else if (stillBusy) {
+            return false
+        }
+
+        stopRequested = false
+        recoveryGesturesAllowed = true
         val wasMining = isRunning()
         try {
             if (wasMining) {
                 foodPauseActive = true
                 drillMissStreak = 0
                 cancelGesturesAndSettle()
-                if (!delayUnlessStopped(FOOD_PAUSE_SETTLE_MS)) return
+                if (!delayUnlessStopped(FOOD_PAUSE_SETTLE_MS)) return false
             }
-            val service = AutoClickAccessibilityService.instance ?: return
+            val service = AutoClickAccessibilityService.instance ?: return false
             runMineCollapseEscapeSequence(service, layoutProvider())
+            return true
         } finally {
-            if (!fireSequenceActive) {
-                drillMissStreak = 0
-                foodPauseActive = false
-            }
+            recoveryGesturesAllowed = false
+            drillMissStreak = 0
+            foodPauseActive = false
         }
+    }
+
+    private fun clearSequenceBusyFlags() {
+        fireSequenceActive = false
+        batterySequenceActive = false
+        foodSequenceRunning = false
+        foodPauseActive = false
     }
 
     /** Eating, food gestures, and post-eat cooldown — no drill/rock/no-mine scans. */
@@ -763,6 +806,8 @@ class MiningEngine {
         textWatchJob = null
         loopJob?.cancel()
         loopJob = null
+        // Cancelling watch jobs mid settle can leave these stuck if set outside try — clear them.
+        clearSequenceBusyFlags()
         recoveryGesturesAllowed = true
         try {
             val service = AutoClickAccessibilityService.instance
@@ -902,6 +947,8 @@ class MiningEngine {
         textWatchJob = null
         loopJob?.cancel()
         loopJob = null
+        // Cancelling watch jobs mid settle can leave these stuck if set outside try — clear them.
+        clearSequenceBusyFlags()
         recoveryGesturesAllowed = true
         try {
             val service = AutoClickAccessibilityService.instance
@@ -1594,13 +1641,13 @@ class MiningEngine {
         layout: SetupLayout
     ) {
         if (fireSequenceActive || batterySequenceActive) return
-        fireSequenceActive = true
-        foodPauseActive = true
-        fireSeen = true
-        drillMissStreak = 0
-        onFireExtinguishToast?.invoke()
-        cancelGesturesAndSettle()
         try {
+            fireSequenceActive = true
+            foodPauseActive = true
+            fireSeen = true
+            drillMissStreak = 0
+            onFireExtinguishToast?.invoke()
+            cancelGesturesAndSettle()
             if (!delayUnlessStopped(FOOD_PAUSE_SETTLE_MS)) return
             if (!delayUnlessStopped(MINE_COLLAPSE_PRE_SWIPE_MS)) return
             toolSwipeLeft(service, layout.tool2Button)
@@ -1623,13 +1670,13 @@ class MiningEngine {
         layout: SetupLayout
     ) {
         if (batterySequenceActive || fireSequenceActive) return
-        batterySequenceActive = true
-        foodPauseActive = true
-        batteryDeadSeen = true
-        drillMissStreak = 0
-        onBatteryDeadToast?.invoke()
-        cancelGesturesAndSettle()
         try {
+            batterySequenceActive = true
+            foodPauseActive = true
+            batteryDeadSeen = true
+            drillMissStreak = 0
+            onBatteryDeadToast?.invoke()
+            cancelGesturesAndSettle()
             if (!delayUnlessStopped(FOOD_PAUSE_SETTLE_MS)) return
             runBatteryDeadMovements(service, layout)
         } finally {

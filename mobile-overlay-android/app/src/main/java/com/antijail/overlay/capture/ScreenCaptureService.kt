@@ -85,6 +85,8 @@ class ScreenCaptureService : Service() {
         private const val SHARED_FRAME_HOT_MAX_AGE_MS = 40L
         /** Slightly looser reuse for slower watchers (fire / OCR). */
         private const val SHARED_FRAME_WATCH_MAX_AGE_MS = 100L
+        /** Upscale chat/UI crops before ML Kit (was 3 — CPU-heavy for little gain). */
+        private const val OCR_UPSCALE = 2
     }
     private val binder = LocalBinder()
     private var mediaProjection: MediaProjection? = null
@@ -1208,8 +1210,13 @@ class ScreenCaptureService : Service() {
             if (rw < 4 || rh < 4) return@withLatestMappedRegion TextDetection.MiningTextScanResult(false, false)
             val cropped = Bitmap.createBitmap(bitmap, left, top, rw, rh)
             try {
+                // Cheap gate: idle chat has no light pixels — skip ML Kit entirely.
+                // When light text appears, always OCR so "nothing to mine" / "battery is dead" still read.
                 val lightText = cropHasLightGameText(cropped)
-                val scale = 3
+                if (!TextDetection.shouldRunMiningOcr(lightText)) {
+                    return@withLatestMappedRegion TextDetection.MiningTextScanResult(false, false)
+                }
+                val scale = OCR_UPSCALE
                 val scaled = Bitmap.createScaledBitmap(
                     cropped,
                     (rw * scale).coerceAtLeast(1),
@@ -1218,11 +1225,7 @@ class ScreenCaptureService : Service() {
                 )
                 try {
                     val ocr = TextDetection.scanMiningMessages(scaled)
-                    TextDetection.MiningTextScanResult(
-                        noMine = lightText || ocr.noMine,
-                        batteryDead = ocr.batteryDead,
-                        rawText = ocr.rawText
-                    )
+                    TextDetection.mergeLightAndOcr(lightText, ocr)
                 } finally {
                     if (scaled !== cropped) scaled.recycle()
                 }
@@ -1255,7 +1258,7 @@ class ScreenCaptureService : Service() {
             forceFresh = true
         ) { crop, originX, originY ->
             if (crop.width < 4 || crop.height < 4) return@withSharedCrop null
-            val scale = 3
+            val scale = OCR_UPSCALE
             val scaled = Bitmap.createScaledBitmap(
                 crop,
                 (crop.width * scale).coerceAtLeast(1),

@@ -46,3 +46,10 @@ emulator-*.png
 
 # Separate nested repo (own remote) — not part of AntiJail
 Graal-Antijail/
+
+# Generated local knowledge graph (cache, stamps, AST dumps)
+graphify-out/
+
+# Local agent / editor config
+.cursor/
+.kilo/

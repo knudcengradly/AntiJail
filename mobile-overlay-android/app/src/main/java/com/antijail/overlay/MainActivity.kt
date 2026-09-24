@@ -89,6 +89,7 @@ class MainActivity : ComponentActivity() {
     private var referenceSpotBaseline: android.graphics.Bitmap? = null
     @Volatile private var noMineToastShown = false
     @Volatile private var fixSetupRunning = false
+    @Volatile private var homeRunning = false
     @Volatile private var playAccent: OverlayPlayAccent = OverlayPlayAccent.IDLE
     private var overlayVisible: Boolean = false
     private var soundMuted: Boolean = false
@@ -177,6 +178,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         installCrashLogger()
+        runCatching { TextDetection.selfCheck() }
+            .onFailure { Log.e(TAG, "TextDetection.selfCheck failed", it) }
         try {
             profileStore = ProfileStore(this)
 
@@ -952,6 +955,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleOverlayHomeButton() {
+        if (homeRunning) return
         if (AutoClickAccessibilityService.instance == null) {
             Toast.makeText(
                 this,
@@ -960,15 +964,32 @@ class MainActivity : ComponentActivity() {
             ).show()
             return
         }
+        homeRunning = true
         lifecycleScope.launch(Dispatchers.Default) {
-            miningSettings = profileStore.miningSettingsFlow.first()
-            overlayController?.showMacroToast("Returning to mine… walking to location ${miningSettings.miningLocation}")
-            miningEngine.runManualMineCollapseEscape(
-                layoutProvider = { scaledSetupLayout() },
-                settings = miningSettings
-            )
-            if (miningEngine.isRunning()) {
-                runOnUiThread { overlayController?.showMacroToast("Resuming mining…") }
+            try {
+                miningSettings = profileStore.miningSettingsFlow.first()
+                val loc = miningSettings.miningLocation
+                val toast = if (!isRunningState) {
+                    "Returning to Location $loc"
+                } else {
+                    "Returning to mine… walking to location $loc"
+                }
+                overlayController?.showMacroToast(toast)
+                val ok = miningEngine.runManualMineCollapseEscape(
+                    layoutProvider = { scaledSetupLayout() },
+                    settings = miningSettings
+                )
+                if (!ok) {
+                    runOnUiThread {
+                        overlayController?.showMacroToast("Home failed — try again")
+                    }
+                    return@launch
+                }
+                if (miningEngine.isRunning()) {
+                    runOnUiThread { overlayController?.showMacroToast("Resuming mining…") }
+                }
+            } finally {
+                homeRunning = false
             }
         }
     }
