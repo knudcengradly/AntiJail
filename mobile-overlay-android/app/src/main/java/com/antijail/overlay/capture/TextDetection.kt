@@ -1,85 +1,141 @@
 package com.antijail.overlay.capture
 
+
+
 import android.graphics.Bitmap
+
 import com.antijail.overlay.model.Point
+
 import com.google.mlkit.vision.common.InputImage
+
 import com.google.mlkit.vision.text.TextRecognition
+
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+
 import kotlinx.coroutines.suspendCancellableCoroutine
+
 import kotlin.coroutines.resume
 
+
+
 object TextDetection {
+
     private val recognizer by lazy {
-        runCatching { selfCheck() }
+
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
     }
+
+
 
     data class MiningTextScanResult(
+
         val noMine: Boolean,
+
         val batteryDead: Boolean,
+
         val rawText: String = ""
+
     )
 
-    /** Skip ML Kit when the chat ROI has no light pixels (idle). */
-    fun shouldRunMiningOcr(hasLightChatText: Boolean): Boolean = hasLightChatText
 
-    /** Merge light-pixel fallback with OCR phrase matches. */
-    fun mergeLightAndOcr(lightText: Boolean, ocr: MiningTextScanResult): MiningTextScanResult =
-        MiningTextScanResult(
-            noMine = lightText || ocr.noMine,
-            batteryDead = ocr.batteryDead,
-            rawText = ocr.rawText
-        )
 
     private fun matchesNoMineMessage(text: String): Boolean {
+
         val normalized = normalizeGameText(text)
+
         if (normalized.contains("nothing here to mine")) return true
+
         if (normalized.contains("nothing to mine")) return true
+
         if (normalized.contains("here to mine")) return true
+
         return normalized.contains("nothing") && normalized.contains("mine")
+
     }
+
+
 
     private fun matchesBatteryDeadMessage(text: String): Boolean {
+
         val normalized = normalizeGameText(text)
+
         if (normalized.contains("battery is dead")) return true
+
         if (normalized.contains("battery dead")) return true
+
         return normalized.contains("battery") && normalized.contains("dead")
+
     }
 
-    internal fun analyzeMiningText(text: String): MiningTextScanResult =
+
+
+    private fun analyzeMiningText(text: String): MiningTextScanResult =
+
         MiningTextScanResult(
+
             noMine = matchesNoMineMessage(text),
+
             batteryDead = matchesBatteryDeadMessage(text),
+
             rawText = text
+
         )
 
+
+
     private fun normalizeGameText(text: String): String =
+
         text.lowercase()
+
             .replace('\n', ' ')
+
             .replace(Regex("[^a-z0-9 ]"), " ")
+
             .replace(Regex("\\s+"), " ")
+
             .trim()
 
-    suspend fun scanMiningMessages(bitmap: Bitmap): MiningTextScanResult =
-        suspendCancellableCoroutine { cont ->
-            val image = InputImage.fromBitmap(bitmap, 0)
-            recognizer.process(image)
-                .addOnSuccessListener { result ->
-                    if (cont.isActive) cont.resume(analyzeMiningText(result.text))
-                }
-                .addOnFailureListener {
-                    if (cont.isActive) cont.resume(MiningTextScanResult(false, false))
-                }
-        }
+
+
+    suspend fun scanMiningMessages(bitmap: Bitmap): MiningTextScanResult = suspendCancellableCoroutine { cont ->
+
+        val image = InputImage.fromBitmap(bitmap, 0)
+
+        recognizer.process(image)
+
+            .addOnSuccessListener { result ->
+
+                if (cont.isActive) cont.resume(analyzeMiningText(result.text))
+
+            }
+
+            .addOnFailureListener {
+
+                if (cont.isActive) cont.resume(MiningTextScanResult(false, false))
+
+            }
+
+    }
+
+
 
     suspend fun containsPhrase(bitmap: Bitmap, phrase: String): Boolean =
+
         when {
+
             phrase.contains("battery", ignoreCase = true) ->
+
                 scanMiningMessages(bitmap).batteryDead
+
             phrase.contains("nothing", ignoreCase = true) ->
+
                 scanMiningMessages(bitmap).noMine
+
             else ->
+
                 scanMiningMessages(bitmap).rawText.contains(phrase, ignoreCase = true)
+
         }
 
     private fun matchesPhrase(text: String, phrase: String): Boolean {
@@ -127,28 +183,6 @@ object TextDetection {
                 }
         }
 
-    /** Smallest check that fails if phrase matchers or the light-text OCR gate break. */
-    fun selfCheck() {
-        check(!shouldRunMiningOcr(false)) { "idle chat must skip OCR" }
-        check(shouldRunMiningOcr(true)) { "light chat must run OCR" }
-
-        val noMine = analyzeMiningText("Nothing here to mine")
-        check(noMine.noMine && !noMine.batteryDead) {
-            "must detect 'nothing here to mine'"
-        }
-        val battery = analyzeMiningText("Battery is dead")
-        check(battery.batteryDead && !battery.noMine) {
-            "must detect 'battery is dead'"
-        }
-        val other = analyzeMiningText("Hello world")
-        check(!other.noMine && !other.batteryDead)
-
-        val mergedNoMine = mergeLightAndOcr(true, noMine)
-        check(mergedNoMine.noMine)
-        val mergedBattery = mergeLightAndOcr(true, battery)
-        check(mergedBattery.batteryDead)
-        // Gate skip path: no light text → empty result, never merge OCR.
-        check(!mergeLightAndOcr(false, MiningTextScanResult(false, false)).noMine)
-        check(!mergeLightAndOcr(false, MiningTextScanResult(false, false)).batteryDead)
-    }
 }
+
+

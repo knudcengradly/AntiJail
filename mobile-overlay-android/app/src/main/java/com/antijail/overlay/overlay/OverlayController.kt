@@ -551,11 +551,10 @@ class OverlayController(
                 })
             }
             bar.addView(createCircleButton("⌂") {
-                showToolbarActionConfirm("Return Home?") { onHome() }
+                showToolbarActionConfirm("Are you sure you want to go back to the mines?") { onHome() }
             })
             bar.addView(createCircleButton("☰") {
-                val foodPrompt = if (!isRunningProvider()) "Eat Food?" else "Are you sure you want to eat?"
-                showToolbarActionConfirm(foodPrompt) { onFood() }
+                showToolbarActionConfirm("Are you sure you want to eat?") { onFood() }
             })
             bar.addView(createCircleButton("⚙") {
                 onSettingsRequested()
