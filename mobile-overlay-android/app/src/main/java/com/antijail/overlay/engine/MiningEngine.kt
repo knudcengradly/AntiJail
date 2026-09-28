@@ -1961,11 +1961,11 @@ class MiningEngine {
         onPlayDrillAlarm: () -> Unit
     ): Boolean {
         var attacks = 0
-        // ponytail: the mined rock and "nothing here to mine" stay on screen after the
-        // switch (and through a spider). Ignore each until it goes false once, then a
-        // new hit can switch. If the old signal never clears, this side runs to the
-        // attack cap instead of bouncing to the previous side.
-        var rockArmed = !useRockDetection
+        // Only a rock already in the box when this side starts is stale (previous side
+        // or a spider). A clean side switches on the first mined rock. Ignoring that
+        // first hit made pollAfterAttack return early and the drill fire again immediately.
+        val staleRock = useRockDetection && rockDetector(attackDir)
+        var rockArmed = !staleRock
         var noMineArmed = !useNoMineDetection
         while (!stopRequested && canRunProvider()) {
             waitIfFoodPaused()
@@ -2013,6 +2013,9 @@ class MiningEngine {
                     waitRockMinedDirectionSwitch(settings, canRunProvider)
                     return true
                 }
+                // Stale rock: the poll returned early, so wait the click gap instead of
+                // drilling this side again immediately.
+                if (!delayUnlessStopped(interval)) return false
             } else {
                 rockArmed = true
             }
