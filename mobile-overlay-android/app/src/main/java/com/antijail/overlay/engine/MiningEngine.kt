@@ -12,11 +12,9 @@ import com.antijail.overlay.model.SpiderClusterResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlin.math.min
 
@@ -36,10 +34,6 @@ class MiningEngine {
     @Volatile private var batteryDeadSeen = false
     @Volatile private var noMineSeen = false
     @Volatile private var noMineClearStreak = 0
-    /** Empty scans before this time must not drop a hit the mining poll has not read yet. */
-    @Volatile private var noMineHoldUntilMs = 0L
-    /** Latest attack asks the text watcher to grab the chat crop. Conflated: one pending scan. */
-    private val textScanKick = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var stopRequested = false
     /**
      * Allows no-drill / reference-spot recovery gestures after [stopRequested] is set,
@@ -204,12 +198,8 @@ class MiningEngine {
         private const val REFERENCE_SPOT_CONFIRM_MS = 300L
         /** Background fire watch cadence — independent of mining timings. */
         private const val FIRE_WATCH_POLL_MS = 1_000L
-        /** Background battery/no-mine OCR watch cadence when no attack has kicked it. */
+        /** Background battery/no-mine OCR watch cadence — independent of mining timings. */
         private const val TEXT_WATCH_POLL_MS = 1_000L
-        /** After an attack, copy the chat crop once the line has drawn. Mining does not wait. */
-        private const val TEXT_POST_CLICK_SETTLE_MS = 200L
-        /** Keep a no-mine hit across a short high-level click gap so the mining poll can read it. */
-        private const val NO_MINE_HOLD_MS = 1_500L
         /** Manual Home: wait this long for an in-flight sequence before force-clearing a stuck flag. */
         private const val HOME_BUSY_WAIT_MS = 15_000L
     }
@@ -282,10 +272,8 @@ class MiningEngine {
         batteryDeadSeen = false
         noMineSeen = false
         noMineClearStreak = 0
-        noMineHoldUntilMs = 0L
         drillMissStreak = 0
         clearPostReturnNoRockWatch()
-        drainTextScanKicks()
         this.onFoodResumingToast = onFoodResumingToast
         this.onSpiderCombatToast = onSpiderCombatToast
         this.onSpiderEatToast = onSpiderEatToast
@@ -409,7 +397,6 @@ class MiningEngine {
         batteryDeadSeen = false
         noMineSeen = false
         noMineClearStreak = 0
-        noMineHoldUntilMs = 0L
         clearPostReturnNoRockWatch()
         AutoClickAccessibilityService.instance?.cancelPendingGestures()
         hpWatchJob?.cancel()
@@ -916,19 +903,10 @@ class MiningEngine {
         }
     }
 
-    private fun requestMiningTextScan() {
-        textScanKick.trySend(Unit)
-    }
-
-    private fun drainTextScanKicks() {
-        while (textScanKick.tryReceive().isSuccess) Unit
-    }
-
     /**
      * Background battery/no-mine OCR watch. Battery-dead starts escape+buy+return immediately
      * here so no-drill/reference cannot stop the macro first. No-mine only sets a flag for
-     * the mining loop (direction switch). An attack kicks this loop so the crop is taken
-     * while the chat line is still up; mining never waits on OCR.
+     * the mining loop (direction switch).
      */
     private suspend fun runTextWatchLoop(
         layoutProvider: () -> SetupLayout,
@@ -937,15 +915,9 @@ class MiningEngine {
         useBatteryDetection: Boolean,
         useNoMineDetection: Boolean
     ) {
-        drainTextScanKicks()
         while (!stopRequested && canRunProvider()) {
-            val kicked = withTimeoutOrNull(TEXT_WATCH_POLL_MS) { textScanKick.receive() } != null
+            if (!delayUnlessStopped(TEXT_WATCH_POLL_MS)) return
             if (stopRequested || !canRunProvider()) return
-            if (kicked) {
-                if (!delayUnlessStopped(TEXT_POST_CLICK_SETTLE_MS)) return
-                // Clicks during the settle share this one scan of the frame now on screen.
-                drainTextScanKicks()
-            }
             if (detectionsSuppressed() || fireSequenceActive || batterySequenceActive) continue
             if (batteryDeadSeen && noMineSeen) continue
             val scan = miningTextScanner()
@@ -953,12 +925,7 @@ class MiningEngine {
                 if (scan.noMine) {
                     noMineSeen = true
                     noMineClearStreak = 0
-                    noMineHoldUntilMs = SystemClock.elapsedRealtime() + NO_MINE_HOLD_MS
-                } else if (
-                    noMineSeen &&
-                    SystemClock.elapsedRealtime() >= noMineHoldUntilMs &&
-                    ++noMineClearStreak >= 2
-                ) {
+                } else if (noMineSeen && ++noMineClearStreak >= 2) {
                     // Two clear scans so one OCR miss does not drop a real "nothing here to mine".
                     noMineSeen = false
                 }
@@ -1721,7 +1688,6 @@ class MiningEngine {
             batteryDeadSeen = false
             noMineSeen = false
             noMineClearStreak = 0
-            noMineHoldUntilMs = 0L
         }
     }
 
@@ -1748,7 +1714,6 @@ class MiningEngine {
             batteryDeadSeen = false
             noMineSeen = false
             noMineClearStreak = 0
-            noMineHoldUntilMs = 0L
         }
     }
 
@@ -2010,7 +1975,6 @@ class MiningEngine {
                 return false
             }
             attacks++
-            requestMiningTextScan()
 
             val postAttack = pollAfterAttack(
                 totalMs = interval,
@@ -2057,7 +2021,6 @@ class MiningEngine {
                 if (noMineArmed) {
                     noMineSeen = false
                     noMineClearStreak = 0
-                    noMineHoldUntilMs = 0L
                     return true
                 }
             } else {
