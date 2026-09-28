@@ -12,9 +12,11 @@ import com.antijail.overlay.model.SpiderClusterResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlin.math.min
 
@@ -27,11 +29,17 @@ class MiningEngine {
     private var textWatchJob: Job? = null
     private var engineScope: CoroutineScope? = null
     private var referenceSpotDetector: (() -> Boolean)? = null
+    private var fireDetector: (() -> Boolean)? = null
     /** Set by the background fire watcher; consumed by the mining loop (instant read). */
     @Volatile private var fireSeen = false
     /** Set by the background OCR text watcher; consumed by the mining loop (instant read). */
     @Volatile private var batteryDeadSeen = false
     @Volatile private var noMineSeen = false
+    @Volatile private var noMineClearStreak = 0
+    /** Empty scans before this time must not drop a hit the mining poll has not read yet. */
+    @Volatile private var noMineHoldUntilMs = 0L
+    /** Latest attack asks the text watcher to grab the chat crop. Conflated: one pending scan. */
+    private val textScanKick = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var stopRequested = false
     /**
      * Allows no-drill / reference-spot recovery gestures after [stopRequested] is set,
@@ -194,8 +202,14 @@ class MiningEngine {
         private const val REFERENCE_SPOT_CONFIRM_MS = 300L
         /** Background fire watch cadence — independent of mining timings. */
         private const val FIRE_WATCH_POLL_MS = 1_000L
-        /** Background battery/no-mine OCR watch cadence — independent of mining timings. */
+        /** Background battery/no-mine OCR watch cadence when no attack has kicked it. */
         private const val TEXT_WATCH_POLL_MS = 1_000L
+        /** After an attack, copy the chat crop once the line has drawn. Mining does not wait. */
+        private const val TEXT_POST_CLICK_SETTLE_MS = 200L
+        /** Keep a no-mine hit across a short high-level click gap so the mining poll can read it. */
+        private const val NO_MINE_HOLD_MS = 1_500L
+        /** Manual Home: wait this long for an in-flight sequence before force-clearing a stuck flag. */
+        private const val HOME_BUSY_WAIT_MS = 15_000L
     }
 
     fun isRunning() = loopJob?.isActive == true
@@ -260,11 +274,16 @@ class MiningEngine {
         spiderThreatActive = false
         fireSequenceActive = false
         batterySequenceActive = false
+        foodPauseActive = false
+        foodSequenceRunning = false
         fireSeen = false
         batteryDeadSeen = false
         noMineSeen = false
+        noMineClearStreak = 0
+        noMineHoldUntilMs = 0L
         drillMissStreak = 0
         clearPostReturnNoRockWatch()
+        drainTextScanKicks()
         this.onFoodResumingToast = onFoodResumingToast
         this.onSpiderCombatToast = onSpiderCombatToast
         this.onSpiderEatToast = onSpiderEatToast
@@ -279,6 +298,7 @@ class MiningEngine {
         this.onPlayDrillAlarm = onPlayDrillAlarm
         this.miningTextScanner = miningTextScanner
         this.referenceSpotDetector = referenceSpotDetector
+        this.fireDetector = fireDetector
         val scope = CoroutineScope(Dispatchers.Default)
         engineScope = scope
         loopJob = scope.launch {
@@ -386,6 +406,8 @@ class MiningEngine {
         fireSeen = false
         batteryDeadSeen = false
         noMineSeen = false
+        noMineClearStreak = 0
+        noMineHoldUntilMs = 0L
         clearPostReturnNoRockWatch()
         AutoClickAccessibilityService.instance?.cancelPendingGestures()
         hpWatchJob?.cancel()
@@ -516,31 +538,51 @@ class MiningEngine {
     /**
      * Overlay home button — pauses mining/detections, runs mine-collapse escape,
      * then walks to the configured mining location and resumes (same as fire / battery return).
+     * @return false only when accessibility is missing or the walk is aborted.
      */
     suspend fun runManualMineCollapseEscape(
         layoutProvider: () -> SetupLayout,
         settings: MiningSettings? = null
-    ) {
+    ): Boolean {
         if (settings != null) activeSettings = settings
-        if (fireSequenceActive || foodSequenceRunning || batterySequenceActive) return
-        stopRequested = false
         detectionCooldownUntilMs = 0L
+
+        val waitStarted = SystemClock.elapsedRealtime()
+        while (
+            (fireSequenceActive || foodSequenceRunning || batterySequenceActive) &&
+            SystemClock.elapsedRealtime() - waitStarted < HOME_BUSY_WAIT_MS
+        ) {
+            delay(50)
+        }
+        if (fireSequenceActive || foodSequenceRunning || batterySequenceActive) {
+            clearSequenceBusyFlags()
+        }
+
+        stopRequested = false
+        recoveryGesturesAllowed = true
         val wasMining = isRunning()
         try {
             if (wasMining) {
                 foodPauseActive = true
                 drillMissStreak = 0
                 cancelGesturesAndSettle()
-                if (!delayUnlessStopped(FOOD_PAUSE_SETTLE_MS)) return
+                if (!delayUnlessStopped(FOOD_PAUSE_SETTLE_MS)) return false
             }
-            val service = AutoClickAccessibilityService.instance ?: return
+            val service = AutoClickAccessibilityService.instance ?: return false
             runMineCollapseEscapeSequence(service, layoutProvider())
+            return true
         } finally {
-            if (!fireSequenceActive) {
-                drillMissStreak = 0
-                foodPauseActive = false
-            }
+            recoveryGesturesAllowed = false
+            drillMissStreak = 0
+            foodPauseActive = false
         }
+    }
+
+    private fun clearSequenceBusyFlags() {
+        fireSequenceActive = false
+        batterySequenceActive = false
+        foodSequenceRunning = false
+        foodPauseActive = false
     }
 
     /** Eating, food gestures, and post-eat cooldown — no drill/rock/no-mine scans. */
@@ -826,8 +868,7 @@ class MiningEngine {
             if (!delayUnlessStopped(REFERENCE_SPOT_CONFIRM_MS)) return
             if (detectionsSuppressed() || isDrillWatchPaused()) continue
             if (detector()) continue
-            handleReferenceSpotLost(layoutProvider, onReferenceLost, onPlayDrillAlarm)
-            return
+            if (handleReferenceSpotLost(layoutProvider, onReferenceLost, onPlayDrillAlarm)) return
         }
     }
 
@@ -853,10 +894,19 @@ class MiningEngine {
         }
     }
 
+    private fun requestMiningTextScan() {
+        textScanKick.trySend(Unit)
+    }
+
+    private fun drainTextScanKicks() {
+        while (textScanKick.tryReceive().isSuccess) Unit
+    }
+
     /**
      * Background battery/no-mine OCR watch. Battery-dead starts escape+buy+return immediately
      * here so no-drill/reference cannot stop the macro first. No-mine only sets a flag for
-     * the mining loop (direction switch).
+     * the mining loop (direction switch). An attack kicks this loop so the crop is taken
+     * while the chat line is still up; mining never waits on OCR.
      */
     private suspend fun runTextWatchLoop(
         layoutProvider: () -> SetupLayout,
@@ -865,14 +915,31 @@ class MiningEngine {
         useBatteryDetection: Boolean,
         useNoMineDetection: Boolean
     ) {
+        drainTextScanKicks()
         while (!stopRequested && canRunProvider()) {
-            if (!delayUnlessStopped(TEXT_WATCH_POLL_MS)) return
+            val kicked = withTimeoutOrNull(TEXT_WATCH_POLL_MS) { textScanKick.receive() } != null
             if (stopRequested || !canRunProvider()) return
+            if (kicked) {
+                if (!delayUnlessStopped(TEXT_POST_CLICK_SETTLE_MS)) return
+                // Clicks during the settle share this one scan of the frame now on screen.
+                drainTextScanKicks()
+            }
             if (detectionsSuppressed() || fireSequenceActive || batterySequenceActive) continue
             if (batteryDeadSeen && noMineSeen) continue
             val scan = miningTextScanner()
-            if (useNoMineDetection && scan.noMine) {
-                noMineSeen = true
+            if (useNoMineDetection) {
+                if (scan.noMine) {
+                    noMineSeen = true
+                    noMineClearStreak = 0
+                    noMineHoldUntilMs = SystemClock.elapsedRealtime() + NO_MINE_HOLD_MS
+                } else if (
+                    noMineSeen &&
+                    SystemClock.elapsedRealtime() >= noMineHoldUntilMs &&
+                    ++noMineClearStreak >= 2
+                ) {
+                    // Two clear scans so one OCR miss does not drop a real "nothing here to mine".
+                    noMineSeen = false
+                }
             }
             if (useBatteryDetection && scan.batteryDead && !batteryDeadSeen) {
                 batteryDeadSeen = true
@@ -885,12 +952,27 @@ class MiningEngine {
         }
     }
 
+    /**
+     * Confirmed reference-spot mismatch.
+     * @return true when the macro was stopped (no fire). False when fire return ran or the check was skipped.
+     */
     private suspend fun handleReferenceSpotLost(
         layoutProvider: () -> SetupLayout,
         onReferenceLost: () -> Unit,
         onPlayDrillAlarm: () -> Unit
-    ) {
-        if (detectionsSuppressed() || isDrillWatchPaused()) return
+    ): Boolean {
+        if (detectionsSuppressed() || isDrillWatchPaused()) return false
+        // Fire watch runs beside this. A collapse changes the spot — return to the mine
+        // instead of the no-drill move-and-stop.
+        if (fireSequenceActive || fireDetector?.invoke() == true) {
+            if (!fireSequenceActive) {
+                val service = AutoClickAccessibilityService.instance
+                if (service != null) {
+                    runMineCollapseEscapeSequence(service, layoutProvider())
+                }
+            }
+            return false
+        }
         // Halt mining first so an in-flight attack can't land after the taunt pause.
         stopRequested = true
         AutoClickAccessibilityService.instance?.cancelPendingGestures()
@@ -916,6 +998,7 @@ class MiningEngine {
         drillWatchJob = null
         referenceSpotWatchJob?.cancel()
         referenceSpotWatchJob = null
+        return true
     }
 
     /** Quick re-check that the drill is really gone (guards against a single bad frame). */
@@ -1594,13 +1677,13 @@ class MiningEngine {
         layout: SetupLayout
     ) {
         if (fireSequenceActive || batterySequenceActive) return
-        fireSequenceActive = true
-        foodPauseActive = true
-        fireSeen = true
-        drillMissStreak = 0
-        onFireExtinguishToast?.invoke()
-        cancelGesturesAndSettle()
         try {
+            fireSequenceActive = true
+            foodPauseActive = true
+            fireSeen = true
+            drillMissStreak = 0
+            onFireExtinguishToast?.invoke()
+            cancelGesturesAndSettle()
             if (!delayUnlessStopped(FOOD_PAUSE_SETTLE_MS)) return
             if (!delayUnlessStopped(MINE_COLLAPSE_PRE_SWIPE_MS)) return
             toolSwipeLeft(service, layout.tool2Button)
@@ -1615,6 +1698,8 @@ class MiningEngine {
             fireSeen = false
             batteryDeadSeen = false
             noMineSeen = false
+            noMineClearStreak = 0
+            noMineHoldUntilMs = 0L
         }
     }
 
@@ -1623,13 +1708,13 @@ class MiningEngine {
         layout: SetupLayout
     ) {
         if (batterySequenceActive || fireSequenceActive) return
-        batterySequenceActive = true
-        foodPauseActive = true
-        batteryDeadSeen = true
-        drillMissStreak = 0
-        onBatteryDeadToast?.invoke()
-        cancelGesturesAndSettle()
         try {
+            batterySequenceActive = true
+            foodPauseActive = true
+            batteryDeadSeen = true
+            drillMissStreak = 0
+            onBatteryDeadToast?.invoke()
+            cancelGesturesAndSettle()
             if (!delayUnlessStopped(FOOD_PAUSE_SETTLE_MS)) return
             runBatteryDeadMovements(service, layout)
         } finally {
@@ -1640,6 +1725,8 @@ class MiningEngine {
             fireSeen = false
             batteryDeadSeen = false
             noMineSeen = false
+            noMineClearStreak = 0
+            noMineHoldUntilMs = 0L
         }
     }
 
@@ -1872,8 +1959,14 @@ class MiningEngine {
         useBatteryDetection: Boolean,
         onDrillLost: () -> Unit,
         onPlayDrillAlarm: () -> Unit
-    ) {
+    ): Boolean {
         var attacks = 0
+        // ponytail: the mined rock and "nothing here to mine" stay on screen after the
+        // switch (and through a spider). Ignore each until it goes false once, then a
+        // new hit can switch. If the old signal never clears, this side runs to the
+        // attack cap instead of bouncing to the previous side.
+        var rockArmed = !useRockDetection
+        var noMineArmed = !useNoMineDetection
         while (!stopRequested && canRunProvider()) {
             waitIfFoodPaused()
             // Instant flag reads — detection ran in the background watchers.
@@ -1883,7 +1976,7 @@ class MiningEngine {
             if (maybeHandleBatteryDead(layoutProvider, useBatteryDetection)) {
                 continue
             }
-            val service = AutoClickAccessibilityService.instance ?: return
+            val service = AutoClickAccessibilityService.instance ?: return false
             if (!performAttack(
                     service,
                     settings,
@@ -1892,9 +1985,10 @@ class MiningEngine {
                     attackDir
                 )
             ) {
-                return
+                return false
             }
             attacks++
+            requestMiningTextScan()
 
             val postAttack = pollAfterAttack(
                 totalMs = interval,
@@ -1912,11 +2006,15 @@ class MiningEngine {
                 continue
             }
             if (postAttack.rockFound) {
-                // First successful rock after return-to-mine ends the Loc 4–6 watch.
-                clearPostReturnNoRockWatch()
-                // Direction switch only — spider kill is owned by the always-on HP watch.
-                waitRockMinedDirectionSwitch(settings, canRunProvider)
-                break
+                if (rockArmed) {
+                    // First successful rock after return-to-mine ends the Loc 4–6 watch.
+                    clearPostReturnNoRockWatch()
+                    // Direction switch only — spider kill is owned by the always-on HP watch.
+                    waitRockMinedDirectionSwitch(settings, canRunProvider)
+                    return true
+                }
+            } else {
+                rockArmed = true
             }
             if (postReturnNoRockWatchActive) {
                 postReturnAttacksWithoutRock++
@@ -1924,23 +2022,30 @@ class MiningEngine {
                     // No rock after 10 attacks — re-run Graal setup, then resume mining.
                     clearPostReturnNoRockWatch()
                     if (!runGraalReturnToGame(service, layoutProvider(), resumeMining = true)) {
-                        return
+                        return false
                     }
                     // Watch re-armed in resumeMiningAfterLocation; keep mining.
                     continue
                 }
             }
             if (postAttack.noMineAtEnd) {
-                noMineSeen = false
-                break
+                if (noMineArmed) {
+                    noMineSeen = false
+                    noMineClearStreak = 0
+                    noMineHoldUntilMs = 0L
+                    return true
+                }
+            } else {
+                noMineArmed = true
             }
 
             if (useRockDetection) {
-                if (attacks >= MAX_ATTACKS_WITHOUT_ROCK) break
+                if (attacks >= MAX_ATTACKS_WITHOUT_ROCK) return true
             } else if (attacks >= DEFAULT_ATTACKS_PER_PHASE) {
-                break
+                return true
             }
         }
+        return false
     }
 
     private suspend fun runMiningLoop(
@@ -1963,6 +2068,7 @@ class MiningEngine {
     ) {
         val interval = totalIntervalMs(settings)
         val phases = resolvePhases(settings.direction)
+        var phaseIndex = 0
 
         if (initialStartDelayPending) {
             initialStartDelayPending = false
@@ -1970,34 +2076,34 @@ class MiningEngine {
         }
 
         while (!stopRequested && canRunProvider()) {
-            for (phase in phases) {
-                waitIfFoodPaused()
-                val (movementDir, attackDir) = phase
+            waitIfFoodPaused()
+            val (movementDir, attackDir) = phases[phaseIndex]
 
-                runPhaseAttacks(
-                    settings,
-                    layoutProvider,
-                    canRunProvider,
-                    drillDetector,
-                    rockDetector,
-                    useRockDetection,
-                    useNoMineDetection,
-                    movementDir,
-                    attackDir,
-                    interval,
-                    healthHitDetector,
-                    spiderClusterDetector,
-                    spiderAlive,
-                    spiderDirection,
-                    fireDetector,
-                    miningTextScanner,
-                    useBatteryDetection,
-                    onDrillLost,
-                    onPlayDrillAlarm
-                )
+            val advance = runPhaseAttacks(
+                settings,
+                layoutProvider,
+                canRunProvider,
+                drillDetector,
+                rockDetector,
+                useRockDetection,
+                useNoMineDetection,
+                movementDir,
+                attackDir,
+                interval,
+                healthHitDetector,
+                spiderClusterDetector,
+                spiderAlive,
+                spiderDirection,
+                fireDetector,
+                miningTextScanner,
+                useBatteryDetection,
+                onDrillLost,
+                onPlayDrillAlarm
+            )
 
-                if (stopRequested || !canRunProvider()) return
-            }
+            if (stopRequested || !canRunProvider()) return
+            if (!advance) return
+            phaseIndex = (phaseIndex + 1) % phases.size
         }
     }
 }

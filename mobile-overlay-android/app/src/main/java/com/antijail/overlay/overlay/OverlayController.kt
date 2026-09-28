@@ -551,10 +551,10 @@ class OverlayController(
                 })
             }
             bar.addView(createCircleButton("⌂") {
-                showToolbarActionConfirm("Are you sure you want to go back to the mines?") { onHome() }
+                showToolbarActionConfirm("Return Home?") { onHome() }
             })
             bar.addView(createCircleButton("☰") {
-                showToolbarActionConfirm("Are you sure you want to eat?") { onFood() }
+                showToolbarActionConfirm("Eat Food?") { onFood() }
             })
             bar.addView(createCircleButton("⚙") {
                 onSettingsRequested()
