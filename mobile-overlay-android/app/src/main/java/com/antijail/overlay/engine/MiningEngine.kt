@@ -185,6 +185,8 @@ class MiningEngine {
         private const val DRILL_PRE_TAP_POLL_MS = 50L
         /** No-drill must persist this long (quick re-confirm) before recovery fires. */
         private const val DRILL_LOSS_CONFIRM_MS = 50L
+        /** After the no-drill taunt, look for fire before deciding to stop. */
+        private const val DRILL_LOST_FIRE_WAIT_MS = 2_000L
         /** Always-on player HP poll — pauses no-drill and starts spider kill (not rock-gated). */
         private const val HP_WATCH_POLL_MS = 500L
         /** Hard cap so false HP cannot pause no-drill forever. */
@@ -788,37 +790,58 @@ class MiningEngine {
         delay(TAUNT_TAP_SETTLE_MS)
     }
 
+    /**
+     * Drill missing: stop-movement and taunt, then wait [DRILL_LOST_FIRE_WAIT_MS].
+     * Fire on the game screen runs the collapse return and mining continues.
+     * No fire is the only path that stops the macro.
+     * @return true when the macro was stopped.
+     */
     private suspend fun handleDrillLost(
         layoutProvider: () -> SetupLayout,
         onDrillLost: () -> Unit,
         onPlayDrillAlarm: () -> Unit
-    ) {
-        if (detectionsSuppressed() || isDrillWatchPaused()) return
-        // Halt mining first so an in-flight attack can't land after the taunt pause.
-        stopRequested = true
+    ): Boolean {
+        if (detectionsSuppressed() || isDrillWatchPaused()) return false
+        // Pause clicks without ending the macro. Fire watch stays up, but suppressed.
+        foodPauseActive = true
+        foodSequenceRunning = true
         AutoClickAccessibilityService.instance?.cancelPendingGestures()
-        hpWatchJob?.cancel()
-        hpWatchJob = null
-        fireWatchJob?.cancel()
-        fireWatchJob = null
-        textWatchJob?.cancel()
-        textWatchJob = null
-        loopJob?.cancel()
-        loopJob = null
-        recoveryGesturesAllowed = true
         try {
             val service = AutoClickAccessibilityService.instance
             if (service != null) {
-                runNoDrillRecovery(service, layoutProvider, onPlayDrillAlarm) { recoveryGesturesAllowed }
+                runNoDrillRecovery(service, layoutProvider, onPlayDrillAlarm) { !stopRequested }
             }
+            if (stopRequested) return true
+            if (!delayUnlessStopped(DRILL_LOST_FIRE_WAIT_MS)) return true
+            val resumeService = AutoClickAccessibilityService.instance
+            if (fireDetector?.invoke() == true && resumeService != null) {
+                foodPauseActive = false
+                foodSequenceRunning = false
+                runMineCollapseEscapeSequence(resumeService, layoutProvider())
+                return false
+            }
+            stopRequested = true
+            AutoClickAccessibilityService.instance?.cancelPendingGestures()
+            hpWatchJob?.cancel()
+            hpWatchJob = null
+            fireWatchJob?.cancel()
+            fireWatchJob = null
+            textWatchJob?.cancel()
+            textWatchJob = null
+            loopJob?.cancel()
+            loopJob = null
+            onDrillLost()
+            drillWatchJob?.cancel()
+            drillWatchJob = null
+            referenceSpotWatchJob?.cancel()
+            referenceSpotWatchJob = null
+            return true
         } finally {
-            recoveryGesturesAllowed = false
+            if (!fireSequenceActive) {
+                foodPauseActive = false
+                foodSequenceRunning = false
+            }
         }
-        onDrillLost()
-        drillWatchJob?.cancel()
-        drillWatchJob = null
-        referenceSpotWatchJob?.cancel()
-        referenceSpotWatchJob = null
     }
 
     /**
@@ -841,8 +864,7 @@ class MiningEngine {
             if (drillDetector()) continue
             if (!confirmDrillMissing(drillDetector)) continue
             if (detectionsSuppressed() || isDrillWatchPaused()) continue
-            handleDrillLost(layoutProvider, onDrillLost, onPlayDrillAlarm)
-            return
+            if (handleDrillLost(layoutProvider, onDrillLost, onPlayDrillAlarm)) return
         }
     }
 
