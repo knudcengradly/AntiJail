@@ -179,8 +179,8 @@ class MiningEngine {
         private const val DRILL_PRE_TAP_POLL_MS = 50L
         /** No-drill must persist this long (quick re-confirm) before recovery fires. */
         private const val DRILL_LOSS_CONFIRM_MS = 50L
-        /** After the no-drill taunt, look for fire before deciding to stop. */
-        private const val DRILL_LOST_FIRE_WAIT_MS = 2_000L
+        /** After a no-drill fire hit, pause this long before the return-to-mine walk. */
+        private const val DRILL_LOST_FIRE_WAIT_MS = 10_000L
         /** Always-on player HP poll — pauses no-drill and starts spider kill (not rock-gated). */
         private const val HP_WATCH_POLL_MS = 500L
         /** Hard cap so false HP cannot pause no-drill forever. */
@@ -778,9 +778,9 @@ class MiningEngine {
     }
 
     /**
-     * Drill missing: stop-movement and taunt, then wait [DRILL_LOST_FIRE_WAIT_MS].
-     * Fire on the game screen runs the collapse return and mining continues.
-     * No fire is the only path that stops the macro.
+     * Drill missing: stop-movement and taunt, then look for fire.
+     * Fire waits [DRILL_LOST_FIRE_WAIT_MS] with mining and detections paused, then the
+     * collapse return runs and mining continues. No fire is the only path that stops the macro.
      * @return true when the macro was stopped.
      */
     private suspend fun handleDrillLost(
@@ -799,9 +799,10 @@ class MiningEngine {
                 runNoDrillRecovery(service, layoutProvider, onPlayDrillAlarm) { !stopRequested }
             }
             if (stopRequested) return true
-            if (!delayUnlessStopped(DRILL_LOST_FIRE_WAIT_MS)) return true
             val resumeService = AutoClickAccessibilityService.instance
             if (fireDetector?.invoke() == true && resumeService != null) {
+                // Fire is already confirmed. Hold here; do not mine or scan during the wait.
+                if (!delayUnlessStopped(DRILL_LOST_FIRE_WAIT_MS)) return true
                 foodPauseActive = false
                 foodSequenceRunning = false
                 runMineCollapseEscapeSequence(resumeService, layoutProvider())
