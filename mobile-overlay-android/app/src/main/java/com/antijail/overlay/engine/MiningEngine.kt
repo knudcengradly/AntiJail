@@ -1953,7 +1953,9 @@ class MiningEngine {
         // first hit made pollAfterAttack return early and the drill fire again immediately.
         val staleRock = useRockDetection && rockDetector(attackDir)
         var rockArmed = !staleRock
-        var noMineArmed = !useNoMineDetection
+        // Same for the chat line: only ignore it when it is already up as this side starts.
+        val staleNoMine = useNoMineDetection && noMineSeen
+        var noMineArmed = !staleNoMine
         while (!stopRequested && canRunProvider()) {
             waitIfFoodPaused()
             // Instant flag reads — detection ran in the background watchers.
